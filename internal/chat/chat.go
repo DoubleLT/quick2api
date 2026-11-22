@@ -34,6 +34,7 @@ import (
 	"net/url"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -187,10 +188,6 @@ func (c *Client) RunTurn(ctx context.Context, sess *session.Session, opts TurnOp
 		return ws.WriteMessage(websocket.BinaryMessage, b)
 	}
 
-	type inbound struct {
-		f   *Frame
-		err error
-	}
 	inCh := make(chan inbound, 64)
 	readErr := make(chan error, 1)
 	go func() {
@@ -323,30 +320,95 @@ func (c *Client) RunTurn(ctx context.Context, sess *session.Session, opts TurnOp
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	// 3. user_message
-	payload := map[string]any{
-		"thread_id":  sid,
-		"text":       opts.Text,
-		"message_id": newUUID(),
+	// 3+4. user_message(s): split over maxSingleText so the AIDP upstream does
+	// not drop the turn with an empty error frame (verified ~64-80KB cutoff).
+	chunks := splitText(opts.Text, maxSingleText)
+	total := len(chunks)
+	var res *TurnResult
+	for i, ch := range chunks {
+		text := ch
+		if total > 1 {
+			if i < total-1 {
+				text = fmt.Sprintf("[CONTEXT PART %d/%d — do not answer yet, just store this context]\n%s", i+1, total, ch)
+			} else {
+				text = fmt.Sprintf("[CONTEXT PART %d/%d — final part. Now answer based on ALL parts above.]\n%s", i+1, total, ch)
+			}
+		}
+		payload := map[string]any{
+			"thread_id":  sid,
+			"text":       text,
+			"message_id": newUUID(),
+		}
+		if opts.AgentMode != "" {
+			payload["agent_mode"] = opts.AgentMode
+		}
+		if opts.ThinkingEffort != "" {
+			payload["thinking_effort"] = opts.ThinkingEffort
+		}
+		if opts.UserTimezone != "" {
+			payload["user_timezone"] = opts.UserTimezone
+		}
+		if opts.UserLocale != "" {
+			payload["user_locale"] = opts.UserLocale
+		}
+		if err := send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
+			return nil, fmt.Errorf("send user_message %d/%d: %w", i+1, total, err)
+		}
+		// Collect this chunk's turn. For non-final chunks we ignore the
+		// model's interim text (it is only context priming); for the final
+		// chunk we keep the reply.
+		sub := &TurnResult{FinishReason: "stop"}
+		got, err := collectTurn(ctx, readErr, inCh, emit, sub)
+		if err != nil {
+			return nil, err
+		}
+		if i == total-1 {
+			res = got
+		}
 	}
-	if opts.AgentMode != "" {
-		payload["agent_mode"] = opts.AgentMode
-	}
-	if opts.ThinkingEffort != "" {
-		payload["thinking_effort"] = opts.ThinkingEffort
-	}
-	if opts.UserTimezone != "" {
-		payload["user_timezone"] = opts.UserTimezone
-	}
-	if opts.UserLocale != "" {
-		payload["user_locale"] = opts.UserLocale
-	}
-	if err := send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
-		return nil, fmt.Errorf("send user_message: %w", err)
-	}
+	return res, nil
+}
 
-	// 4. collect until message_complete (or close).
-	res := &TurnResult{FinishReason: "stop"}
+// inbound is one read result off the websocket.
+type inbound struct {
+	f   *Frame
+	err error
+}
+
+// maxSingleText is the largest user_message text the AIDP upstream accepts
+// before it closes the turn with an empty {"type":"error"} frame. Verified
+// 2026-11-22: 64_000 bytes OK, 80_000 rejected. Keep margin for framing text.
+const maxSingleText = 55_000
+
+// splitText cuts s into pieces of at most n bytes on rune boundaries.
+func splitText(s string, n int) []string {
+	if len(s) <= n {
+		return []string{s}
+	}
+	var out []string
+	for len(s) > 0 {
+		cut := n
+		if cut > len(s) {
+			cut = len(s)
+		}
+		for cut > 0 && !utf8.ValidString(s[:cut]) {
+			cut--
+		}
+		if cut == 0 {
+			cut = n
+			if cut > len(s) {
+				cut = len(s)
+			}
+		}
+		out = append(out, s[:cut])
+		s = s[cut:]
+	}
+	return out
+}
+
+// collectTurn reads inbound frames until message_complete, session end, or
+// close; extracted so multi-chunk turns can reuse it per sub-message.
+func collectTurn(ctx context.Context, readErr <-chan error, inCh <-chan inbound, emit func(TurnEvent), res *TurnResult) (*TurnResult, error) {
 	var textSeen atomic.Bool
 	for {
 		select {

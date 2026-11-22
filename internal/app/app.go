@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kilbertert/quick2api/internal/api/anthropic"
 	"github.com/kilbertert/quick2api/internal/api/openai"
 	"github.com/kilbertert/quick2api/internal/bridge"
 	"github.com/kilbertert/quick2api/internal/config"
@@ -16,11 +17,12 @@ import (
 
 // App is the running server.
 type App struct {
-	Cfg     *config.Config
-	Bridge  *bridge.Bridge
-	Debug   *debuglog.Logger
-	Handler *openai.Handler
-	Mux     *http.ServeMux
+	Cfg      *config.Config
+	Bridge   *bridge.Bridge
+	Debug    *debuglog.Logger
+	Handler  *openai.Handler
+	Anthropic *anthropic.Handler
+	Mux      *http.ServeMux
 }
 
 // New builds the app over an already-initialized bridge.
@@ -29,19 +31,18 @@ func New(cfg *config.Config, b *bridge.Bridge, dlog *debuglog.Logger) *App {
 	if max <= 0 {
 		max = 16
 	}
-	h := &openai.Handler{
-		Bridge: b,
-		Cfg:    cfg,
-		Debug:  dlog,
-		Sem:    make(chan struct{}, max),
-	}
-	a := &App{Cfg: cfg, Bridge: b, Debug: dlog, Handler: h, Mux: http.NewServeMux()}
+	sem := make(chan struct{}, max)
+	h := &openai.Handler{Bridge: b, Cfg: cfg, Debug: dlog, Sem: sem}
+	ah := &anthropic.Handler{Bridge: b, Cfg: cfg, Debug: dlog, Sem: sem}
+	a := &App{Cfg: cfg, Bridge: b, Debug: dlog, Handler: h, Anthropic: ah, Mux: http.NewServeMux()}
 	a.routes()
 	return a
 }
 
 func (a *App) routes() {
 	a.Mux.HandleFunc("POST /v1/chat/completions", a.auth(a.Handler.ChatCompletions))
+	a.Mux.HandleFunc("POST /v1/messages", a.auth(a.Anthropic.Messages))
+	a.Mux.HandleFunc("POST /v1/messages/count_tokens", a.auth(a.Anthropic.Messages))
 	a.Mux.HandleFunc("GET /v1/models", a.auth(a.Handler.Models))
 	a.Mux.HandleFunc("GET /healthz", a.healthz)
 	a.Mux.HandleFunc("GET /{$}", a.index)
@@ -85,6 +86,7 @@ func (a *App) index(w http.ResponseWriter, r *http.Request) {
 		"version": version,
 		"endpoints": []string{
 			"POST /v1/chat/completions",
+			"POST /v1/messages",
 			"GET  /v1/models",
 			"GET  /healthz",
 		},
