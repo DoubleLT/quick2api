@@ -1,0 +1,19 @@
+# build artifacts
+/quick2api
+/quick2api.exe
+*.exe
+/dist/
+
+# local config & state
+/config.yaml
+/config.local.yaml
+state/
+debug/
+sess.json
+*.log
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.err

@@ -1,0 +1,161 @@
+// quick2api exposes the model behind a logged-in Amazon Quick desktop
+// account as an OpenAI-compatible /v1 API. See README.md for the chain.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime/debug"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/kilbertert/quick2api/internal/app"
+	"github.com/kilbertert/quick2api/internal/bridge"
+	"github.com/kilbertert/quick2api/internal/chat"
+	"github.com/kilbertert/quick2api/internal/config"
+	"github.com/kilbertert/quick2api/internal/debuglog"
+)
+
+// version is injected via -ldflags "-X main.version=vX.Y.Z"; the fallbacks
+// below cover `go install @version` and plain `go build` inside the checkout.
+var version = "dev"
+
+func resolvedVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return info.Main.Version
+		}
+		var rev string
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" {
+				rev = s.Value
+			}
+		}
+		if rev != "" {
+			if len(rev) > 12 {
+				rev = rev[:12]
+			}
+			return "dev-" + rev
+		}
+	}
+	return version
+}
+
+func main() {
+	configPath := flag.String("config", "", "YAML 配置文件路径；缺省按 $QUICK2API_CONFIG → ./config.yaml → 平台默认目录解析")
+	stateDir := flag.String("state-dir", "", "调试日志与状态目录；缺省按 $QUICK2API_STATE_DIR → 平台默认目录解析")
+	showVersion := flag.Bool("version", false, "打印构建版本后退出")
+	probe := flag.Bool("probe", false, "起桥 + 发一条探针消息验证上游链路后退出（不起服务）")
+	probeText := flag.String("probe-text", "Reply with exactly: PONG", "配合 -probe 使用的探针消息")
+	flag.Parse()
+
+	resolved := resolvedVersion()
+	if *showVersion {
+		fmt.Println(resolved)
+		return
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	app.SetVersion(resolved)
+
+	cfgPath, err := config.ResolveConfigPath(*configPath)
+	if err != nil {
+		slog.Error("resolve config path", "error", err)
+		os.Exit(1)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		// Missing file → defaults only; parse/validation errors → fatal.
+		if errors.Is(err, os.ErrNotExist) {
+			cfg = config.Defaults()
+			slog.Warn("config not found, running on defaults", "path", cfgPath)
+		} else {
+			slog.Error("load config", "path", cfgPath, "error", err)
+			os.Exit(1)
+		}
+	}
+	state, err := config.ResolveStateDir(*stateDir)
+	if err != nil {
+		slog.Error("resolve state dir", "error", err)
+		os.Exit(1)
+	}
+	dlog, err := debuglog.New(state, cfg.Debug.Enabled, cfg.Debug.RetentionDays, cfg.Debug.LogFrames)
+	if err != nil {
+		slog.Error("init debug log", "error", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	b, err := bridge.New(ctx, cfg)
+	if err != nil {
+		slog.Error("init upstream bridge", "error", err)
+		os.Exit(1)
+	}
+	defer b.Close()
+
+	if *probe {
+		if err := runProbe(ctx, cfg, b, *probeText); err != nil {
+			slog.Error("probe failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	a := app.New(cfg, b, dlog)
+	srv := &http.Server{
+		Addr:              cfg.Server.Listen,
+		Handler:           a.Mux,
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shCtx)
+	}()
+
+	slog.Info("quick2api listening",
+		"addr", cfg.Server.Listen, "version", resolved,
+		"config", cfgPath, "state", state)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("serve", "error", err)
+		os.Exit(1)
+	}
+}
+
+// runProbe sends one canned turn and prints the result — the quickest way to
+// prove the outpost → session → WSS chain works on this machine.
+func runProbe(ctx context.Context, cfg *config.Config, b *bridge.Bridge, text string) error {
+	res, err := b.RunTurn(ctx, chat.TurnOpts{
+		Text:           text,
+		AgentMode:      cfg.Quick.DefaultAgentMode,
+		ThinkingEffort: cfg.Quick.ThinkingEffort,
+		UserTimezone:   cfg.Quick.UserTimezone,
+		UserLocale:     cfg.Quick.UserLocale,
+		Title:          "quick2api probe",
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println("=== probe reply ===")
+	fmt.Println(res.Text)
+	fmt.Printf("\nresolved_model=%s finish=%s\n", res.ResolvedModel, res.FinishReason)
+	if res.Usage != nil {
+		fmt.Printf("usage: in=%d out=%d cache_read=%d cache_write=%d cost_usd=%.6f model=%s\n",
+			res.Usage.InputTokens, res.Usage.OutputTokens,
+			res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
+			res.Usage.CostUSD, strings.TrimSpace(res.Usage.Model))
+	}
+	return nil
+}

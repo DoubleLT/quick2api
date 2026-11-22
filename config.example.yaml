@@ -1,0 +1,79 @@
+# quick2api 配置模板。未注释的键建议过一眼；注释掉的块是可选调优
+#（默认值写在注释里，不取消即按默认走）。最小起步零编辑：
+# 桌面版 Amazon Quick 登录过的机器上，跑 `quick2api -probe` 直接验证链路。
+
+server:
+  # 只绑回环——这台机器就是上游凭据的边界；对外暴露请走反代。
+  listen: "127.0.0.1:8377"
+  # 同时运行的 /v1/* 完成请求数上限；多余的请求直接 429 快速失败，
+  # 不在本地排队——Quick 账号配额是共享的，排队救不了它。
+  max_concurrency: 16
+  # 单次上游回合（ws open → message_complete）的最大时长秒数。默认 600。
+  # turn_timeout_seconds: 600
+
+debug:
+  # 请求级调试记录：每个请求一个目录 <state>/debug/<ts>-<id>/，
+  # 含 00-request/01-frames/02-response。开起来排障才有弹药。
+  enabled: true
+  # 调试目录保留天数，按启动时一次性清理；<=0 不清。默认 14。
+  # retention_days: 14
+  # 额外记录上行所有协议帧到 01-frames（文本帧不含凭据，放心开）。默认 false。
+  # log_frames: true
+
+quick:
+  # quickwork-agent 二进制路径。空值自动探测标准位置：
+  #   Windows: %LOCALAPPDATA%\quickwork\agent\quickwork-agent.exe
+  #   Linux:   ~/.local/share/quickwork/agent/quickwork-agent
+  # agent_path: ""
+  # agent 需要的 -manifest 参数（桌面装的就是 desktop）。默认 desktop。
+  # manifest: "desktop"
+  # QUICKWORK_BUILD_STAGE 环境变量；正式装必须 prod，缺这个 agent 直接
+  # RuntimeError 退出。默认 prod。
+  # build_stage: "prod"
+  # 我们自建的 outpost 监听端口。0 = 自动挑空闲回环端口（推荐，
+  # 上次崩溃残留的实例不会撞车）。绝对不要复用 8780——那是桌面应用
+  # 自己的 outpost，它的 bearer 只活在那个应用的主进程内存里。
+  # outpost_port: 0
+  # 跳过自启 outpost、直接指向一个已在跑的实例时两个键一起填：
+  # outpost_url: "http://127.0.0.1:8781"
+  # outpost_token: "<该实例的 stdin token>"
+  # 或者从文件加载一份抓下来的 sncs-session（CI/测试逃逸口，与上面互斥）：
+  # session_file: "./sess.json"
+  # AIDP 双向流参数（一般不用动）：
+  # surface_type: "QUICK_WORK_DESKTOP_WINDOWS"
+  # channel: "prod"
+  # origin: "https://quick.aws.com"
+  # 发给上游的会话环境。
+  user_timezone: "Asia/Shanghai"
+  user_locale: "zh-CN"
+  # 缺省 agent_mode（客户端 model 未命中 agent_modes 时使用）。实测
+  # turn_usage.model 回 "smart"、resolved_model_id 回真实模型名。
+  default_agent_mode: "smart"
+  # thinking_effort 透传值（low/medium/high/max）；客户端 reasoning_effort
+  # 优先于它。空值不发。
+  # thinking_effort: ""
+  # 严格握手：session_connect/session_create 未等到 ACK 即失败而非继续
+  # 发送（服务端偶尔会漏 ACK，默认 false 更稳）。
+  # strict_handshake: false
+  # handshake_timeout_seconds: 10
+  # 客户端 model 名 → 上游 agent_mode 的映射；同时是 /v1/models 的广告面。
+  agent_modes:
+    quick: "smart"
+    quick-smart: "smart"
+    # 实测上游回 resolved_model_id = "us.anthropic.claude-opus-5-5"；
+    # 若上游支持别的 agent_mode 值，在这里加键。
+  # 额外只用于 /v1/models 展示的别名：
+  # models:
+  #   - "claude-opus-5-5"
+  # sncs-session 复用秒数；到期重新向 outpost 取（token 本身由 outpost 管
+  # 理，约 7 天可用期）。默认 600——比上游实际寿命长得多没关系，取新的
+  # 成本就是一次本地 HTTP。
+  # session_ttl_seconds: 600
+  # 上行 WSS 的 HTTP 代理；留空走系统 HTTPS_PROXY/HTTP_PROXY，
+  # "direct" 强制直连。
+  # proxy: ""
+
+api:
+  # 下游 /v1/* 的 Bearer 校验。空值=不校验——只在 listen 为回环时可接受。
+  # 本机用给自己起一个长一点的随机串即可：
+  # api_key: "q2a-local-<随机>"
