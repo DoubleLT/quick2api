@@ -149,17 +149,43 @@ frame — no code, no message. Verified 2026-11-22: 64 000 bytes goes
 through, 80 000 does not; the exact cutoff sits somewhere in between and
 probably depends on framing overhead.
 
-quick2api works around this by splitting the rendered prompt into
-≤ 55 000-byte rune-boundary chunks and sending them as **sequential
-`user_message` turns inside the same session**. Non-final chunks are
-prefixed with `[CONTEXT PART i/N — do not answer yet, just store this
-context]` so the model stores them; the last chunk is prefixed
-`[CONTEXT PART N/N — final part. Now answer based on ALL parts above.]`
-and its `text_delta` / `turn_usage` / `message_complete` frames are what
-the caller sees. Side effects to be aware of:
+quick2api has two workarounds, tried in this order:
+
+**Primary — out-of-band attachment.** The renderer uploads files through
+the tenant's attachment service and references them from a short
+`user_message`; the model reads the file server-side in **one** turn.
+quick2api mirrors that path:
+
+1. `POST {tenant}/integration/quick-work/upload-attachment?name=…&contentType=text/plain&contentLength=…`
+   with the prompt as the octet-stream body → `{attachmentId}`.
+2. `GET {tenant}/integration/quick-work/attachment-dlp-status?attachmentId=…`
+   polled until `policyAction=ALLOW` (or `dlpJobStatus` is
+   SKIPPED/NOT_APPLICABLE/DISABLED).
+3. Deliver: `POST {tenant}/integration/quick-work/qbs-event` with
+   `invokeAgent{path:"files/upload/<conversationId>",_method:POST,body:{attachmentId}}`
+   → `{path}` (nested inside `eventResponse.invokeAgentResponse` →
+   `api_response.body`).
+4. `user_message` is sent with
+   `payload.attachments=[{type:"file",name,size,mimeType,path,attachmentId}]`
+   and a short text telling the model to read the file.
+
+Note the classic MTU pattern: the ~64–80 KB limit lives in the frame
+codec, not the model — attachments bypass the frame entirely.
+
+**Fallback — sequential chunks.** If the upload or deliver step fails
+(e.g. attachments unavailable on a provider/edition, or `path` comes back
+empty), the prompt is split into ≤ 55 000-byte rune-boundary chunks sent
+as sequential `user_message` turns in the same session. Non-final chunks
+are prefixed `[CONTEXT PART i/N — do not answer yet, just store this
+context]`; the last gets `[CONTEXT PART N/N — final part. Now answer
+based on ALL parts above.]` and its `text_delta` / `turn_usage` /
+`message_complete` frames are what the caller sees.
+
+Side effects of the chunk fallback:
 
 - **One API call = N upstream turns.** A 200 KB prompt becomes ~4 model
-  turns, so upstream token cost and latency scale with chunk count.
+  turns, so upstream token cost and latency scale with chunk count —
+  this is exactly why the attachment path exists.
 - Interim chunks' replies are discarded; only the last turn's reply is
   surfaced.
 - Empty `error` frames from the upstream lose their detail — see

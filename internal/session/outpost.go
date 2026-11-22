@@ -22,11 +22,11 @@ import (
 
 // SpawnOpts parameterizes Spawn.
 type SpawnOpts struct {
-	AgentPath string
-	Manifest  string // -manifest value, "desktop"
+	AgentPath  string
+	Manifest   string // -manifest value, "desktop"
 	BuildStage string // QUICKWORK_BUILD_STAGE
-	Port      int
-	WorkDir   string // agent working dir; empty = os.TempDir
+	Port       int
+	WorkDir    string // agent working dir; empty = os.TempDir
 }
 
 // Outpost is a running quickwork-agent outpost instance.
@@ -194,6 +194,10 @@ func (o *Outpost) FetchSession() (*Session, error) {
 	} else {
 		slog.Warn("outpost id lookup failed; chat will use a synthetic id", "error", err)
 	}
+	// Keep the outpost identity for future local-API needs (the cloud
+	// attachment path uses TenantURL, not this loopback — see
+	// chat.uploadAttachment).
+	s.OutpostURL, s.OutpostToken = o.URL, o.Token
 	return &s, nil
 }
 
