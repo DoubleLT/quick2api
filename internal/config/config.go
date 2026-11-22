@@ -111,6 +111,30 @@ type QuickConfig struct {
 	// Proxy optionally overrides the HTTP(S) proxy used for the outbound WSS
 	// dial (falls back to HTTPS_PROXY/HTTP_PROXY env). "direct" disables proxy.
 	Proxy string `yaml:"proxy"`
+	// Accounts, when non-empty, turns the bridge into a lane pool: each
+	// entry is an independent session source (outpost_url+token, or
+	// session_file; spawn falls back to the top-level fields). Lanes
+	// rotate round-robin; a lane that answers 401/403/5xx cools down for
+	// cooldown_seconds before serving again. One account = the current
+	// single-lane behavior.
+	Accounts           []AccountConfig `yaml:"accounts"`
+	CooldownSecs       int             `yaml:"cooldown_seconds"`
+	SessionAffinityTTL int             `yaml:"session_affinity_ttl_seconds"`
+}
+
+// AccountConfig is one lane of the upstream pool. Exactly one of the
+// three sources must be set:
+//   - outpost_url + outpost_token   → attach to a running outpost
+//   - session_file                  → load a captured sncs-session JSON
+//   - (empty fields)                → spawn quickwork-agent locally with
+//                                    the top-level AgentPath/Manifest/etc.
+type AccountConfig struct {
+	Name         string `yaml:"name"` // shown in /healthz lanes[] and logs
+	OutpostURL   string `yaml:"outpost_url"`
+	OutpostToken string `yaml:"outpost_token"`
+	SessionFile  string `yaml:"session_file"`
+	// Cooldown overrides the pool-wide default for this lane.
+	CooldownS int `yaml:"cooldown_seconds"`
 }
 
 // APIConfig controls the downstream-facing surface.

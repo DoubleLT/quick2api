@@ -19,7 +19,7 @@ import (
 // App is the running server.
 type App struct {
 	Cfg      *config.Config
-	Bridge   *bridge.Bridge
+	Bridge   *bridge.Pool
 	Debug    *debuglog.Logger
 	Handler  *openai.Handler
 	Anthropic *anthropic.Handler
@@ -27,7 +27,7 @@ type App struct {
 }
 
 // New builds the app over an already-initialized bridge.
-func New(cfg *config.Config, b *bridge.Bridge, dlog *debuglog.Logger) *App {
+func New(cfg *config.Config, b *bridge.Pool, dlog *debuglog.Logger) *App {
 	max := cfg.Server.MaxConcurrency
 	if max <= 0 {
 		max = 16
@@ -45,7 +45,9 @@ func New(cfg *config.Config, b *bridge.Bridge, dlog *debuglog.Logger) *App {
 		tcfg.Bash.TimeoutS = cfg.Tools.Bash.TimeoutS
 		tcfg.Files.Enabled = cfg.Tools.Files.Enabled
 		tcfg.Files.Root = cfg.Tools.Files.Root
-		ah.Tools = tools.New(tcfg)
+		exec := tools.New(tcfg)
+		ah.Tools = exec
+		h.Tools = exec
 	}
 	a := &App{Cfg: cfg, Bridge: b, Debug: dlog, Handler: h, Anthropic: ah, Mux: http.NewServeMux()}
 	a.routes()

@@ -35,7 +35,7 @@ import (
 
 // Handler serves Anthropic-compatible endpoints.
 type Handler struct {
-	Bridge *bridge.Bridge
+	Bridge *bridge.Pool
 	Cfg    *config.Config
 	Debug  *debuglog.Logger
 	Sem    chan struct{}
@@ -303,13 +303,7 @@ func (h *Handler) runAgent(ctx context.Context,
 			return nil, err
 		}
 
-		blocks := parseToolCalls(res.Text)
-		var calls []ContentBlock
-		for _, b := range blocks {
-			if b.Type == "tool_use" {
-				calls = append(calls, b)
-			}
-		}
+		calls, _ := common.ParseToolCallsJSON(res.Text)
 		if len(calls) == 0 || h.Tools == nil {
 			return res, nil
 		}
@@ -511,13 +505,8 @@ func renderPrompt(req *MessagesRequest) (text string, atts []chat.Attachment, er
 	}
 
 	// tools → instruction block so the agent can see its own schemas.
-	if len(req.Tools) > 0 && string(req.Tools) != "null" && string(req.Tools) != "[]" {
-		b.WriteString("The user has declared the following tools available for use. " +
-			"When you want to use one, respond with ONLY the JSON object " +
-			"{\"type\":\"tool_use\",\"id\":\"<id>\",\"name\":\"<tool name>\"," +
-			"\"input\":{...}}. Do not wrap it in markdown.\nTools:\n")
-		b.WriteString(string(req.Tools))
-		b.WriteString("\n\n")
+	if ins := common.ToolsInstruction(req.Tools); ins != "" {
+		b.WriteString(ins)
 	}
 
 	for _, m := range req.Messages {

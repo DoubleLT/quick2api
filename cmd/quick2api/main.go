@@ -97,7 +97,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	b, err := bridge.New(ctx, cfg)
+	b, err := bridge.BuildPool(ctx, cfg)
 	if err != nil {
 		slog.Error("init upstream bridge", "error", err)
 		os.Exit(1)
@@ -136,7 +136,7 @@ func main() {
 
 // runProbe sends one canned turn and prints the result — the quickest way to
 // prove the outpost → session → WSS chain works on this machine.
-func runProbe(ctx context.Context, cfg *config.Config, b *bridge.Bridge, text string) error {
+func runProbe(ctx context.Context, cfg *config.Config, b *bridge.Pool, text string) error {
 	res, err := b.RunTurn(ctx, chat.TurnOpts{
 		Text:           text,
 		AgentMode:      cfg.Quick.DefaultAgentMode,

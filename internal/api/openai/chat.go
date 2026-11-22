@@ -6,10 +6,13 @@ package openai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,15 +21,18 @@ import (
 	"github.com/kilbertert/quick2api/internal/chat"
 	"github.com/kilbertert/quick2api/internal/config"
 	"github.com/kilbertert/quick2api/internal/debuglog"
+	"github.com/kilbertert/quick2api/internal/tools"
 	"github.com/kilbertert/quick2api/internal/util"
 )
 
 // Handler serves OpenAI-compatible endpoints.
 type Handler struct {
-	Bridge *bridge.Bridge
+	Bridge *bridge.Pool
 	Cfg    *config.Config
 	Debug  *debuglog.Logger
 	Sem    chan struct{} // concurrency ceiling
+	// Tools is the server-side executor; nil = advisory mode.
+	Tools tools.Executor
 }
 
 // ---------- request/response types (subset of the OpenAI schema) ----------
@@ -45,6 +51,10 @@ type ChatRequest struct {
 	ToolChoice       json.RawMessage `json:"tool_choice"`
 	Stop             json.RawMessage `json:"stop"`
 	N                int             `json:"n"`
+	// ConversationID pins the upstream thread (same contract as
+	// /v1/messages): when set the bridge pools one conversation per id.
+	ConversationID string `json:"conversation_id,omitempty"`
+	User           string `json:"user,omitempty"` // fallback thread key
 }
 
 type StreamOptions struct {
@@ -55,6 +65,11 @@ type Message struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
 	Name    string          `json:"name"`
+	// ToolCalls carries assistant-side function calls when the client
+	// echoes its own history; we flatten them into the transcript.
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	// ToolCallID correlates a role=tool message to its call.
+	ToolCallID string `json:"tool_call_id,omitempty"`
 }
 
 type choice struct {
@@ -65,8 +80,20 @@ type choice struct {
 }
 
 type MessageOut struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	ToolCalls []ToolCall      `json:"tool_calls,omitempty"`
+}
+
+// ToolCall is OpenAI's function-call shape. We translate the model's
+// tool_use JSON into this so clients see their declared function names.
+type ToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"` // always "function"
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"` // JSON-encoded
+	} `json:"function"`
 }
 
 type completion struct {
@@ -112,14 +139,26 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "n>1 unsupported: Quick runs one turn per request", "")
 		return
 	}
-	if len(req.Tools) > 0 && string(req.Tools) != "null" && string(req.Tools) != "[]" {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "client-side tools unsupported in v1: Quick's agent runs its own tools upstream", "")
-		return
-	}
-	text, err := renderTranscript(req.Messages)
+	text, atts, err := renderTranscript(req.Messages)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
 		return
+	}
+	// tools → same instruction contract the Anthropic adapter emits so the
+	// upstream model sees one protocol regardless of which surface the
+	// client speaks.
+	if ins := common.ToolsInstruction(req.Tools); ins != "" {
+		text = ins + text
+	}
+	conversationID := strings.TrimSpace(req.ConversationID)
+	if conversationID == "" {
+		conversationID = strings.TrimSpace(r.Header.Get("X-Conversation-Id"))
+	}
+	if conversationID == "" {
+		conversationID = strings.TrimSpace(r.Header.Get("X-Session-Id"))
+	}
+	if conversationID == "" {
+		conversationID = strings.TrimSpace(req.User)
 	}
 
 	// concurrency ceiling
@@ -153,26 +192,22 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	if req.Stream {
-		h.stream(w, r, ctx, reqID, model, agentMode, thinking, text, dlogDir)
+		h.stream(w, r, ctx, reqID, model, agentMode, thinking, text, atts,
+			conversationID, dlogDir)
 		return
 	}
-	h.complete(w, r, ctx, reqID, model, agentMode, thinking, text, dlogDir)
+	h.complete(w, r, ctx, reqID, model, agentMode, thinking, text, atts,
+		conversationID, dlogDir)
 }
 
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	reqID, model, agentMode, thinking, text, dlogDir string) {
+	reqID, model, agentMode, thinking, text string,
+	atts []chat.Attachment, conversationID, dlogDir string) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.Bridge.RunTurn(ctx, chat.TurnOpts{
-		Text:           text,
-		AgentMode:      agentMode,
-		ThinkingEffort: thinking,
-		UserTimezone:   h.Cfg.Quick.UserTimezone,
-		UserLocale:     h.Cfg.Quick.UserLocale,
-		Title:          "quick2api " + reqID,
-		OnEvent:        frames.OnEvent,
-	})
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
+		conversationID, frames, nil)
 	frames.Write(h.Debug, dlogDir)
 	if err != nil {
 		h.finishDebug(dlogDir, nil, err)
@@ -186,19 +221,124 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.C
 		Model:   util.Or(res.ResolvedModel, model),
 		Choices: []choice{{
 			Index:        0,
-			Message:      &MessageOut{Role: "assistant", Content: res.Text},
+			Message:      messageOutFor(res.Text),
 			FinishReason: res.FinishReason,
 		}},
 		Usage: mapUsage(res.Usage),
+	}
+	// finish_reason=tool_calls when the answer is a tool call.
+	if calls, ok := common.ParseToolCallsJSON(res.Text); ok && len(calls) > 0 {
+		out.Choices[0].FinishReason = "tool_calls"
+		out.Choices[0].Message = &MessageOut{
+			Role:      "assistant",
+			Content:   "",
+			ToolCalls: openAIToolCalls(calls),
+		}
 	}
 	h.finishDebug(dlogDir, &out, nil)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// runAgent mirrors the Anthropic handler's tool loop: when h.Tools is
+// enabled and the reply parses as a tool call, execute it locally and
+// feed the result back until the model stops calling tools.
+func (h *Handler) runAgent(ctx context.Context,
+	reqID, agentMode, thinking, text string,
+	atts []chat.Attachment, conversationID string,
+	frames *common.Frames, onDelta func(string)) (*chat.TurnResult, error) {
+
+	maxRounds := h.Cfg.Tools.MaxToolRounds
+	if maxRounds <= 0 {
+		maxRounds = 4
+	}
+	if h.Tools == nil {
+		maxRounds = 1
+	}
+
+	prompt := text
+	var res *chat.TurnResult
+	var err error
+	for round := 0; round < maxRounds; round++ {
+		res, err = h.Bridge.RunTurn(ctx, chat.TurnOpts{
+			Text:           prompt,
+			AgentMode:      agentMode,
+			ThinkingEffort: thinking,
+			UserTimezone:   h.Cfg.Quick.UserTimezone,
+			UserLocale:     h.Cfg.Quick.UserLocale,
+			Title:          "quick2api " + reqID,
+			ConversationID: conversationID,
+			Attachments:    atts,
+			OnEvent: func(ev chat.TurnEvent) {
+				frames.OnEvent(ev)
+				if onDelta != nil && ev.Kind == "delta" && ev.Text != "" {
+					onDelta(ev.Text)
+				}
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		calls, _ := common.ParseToolCallsJSON(res.Text)
+		if len(calls) == 0 || h.Tools == nil {
+			return res, nil
+		}
+
+		var next strings.Builder
+		fmt.Fprintf(&next, "Assistant: %s\n\n", res.Text)
+		for _, c := range calls {
+			result, isErr := h.Tools.Exec(ctx, c.Name, c.Input)
+			label := "ToolResult"
+			if isErr {
+				label += " (error)"
+			}
+			fmt.Fprintf(&next, "%s for %s(%s): %s\n\n",
+				label, c.Name, string(c.Input), result)
+		}
+		prompt = strings.TrimSpace(next.String())
+		if prompt == "" {
+			return res, nil
+		}
+		atts = nil // subsequent turns don't need the attachments again
+	}
+	return res, nil
+}
+
+// messageOutFor picks the OpenAI message shape: a tool_call answer turns
+// into tool_calls[], otherwise plain content.
+func messageOutFor(text string) *MessageOut {
+	if calls, ok := common.ParseToolCallsJSON(text); ok && len(calls) > 0 {
+		return &MessageOut{
+			Role:      "assistant",
+			Content:   "",
+			ToolCalls: openAIToolCalls(calls),
+		}
+	}
+	return &MessageOut{Role: "assistant", Content: text}
+}
+
+// openAIToolCalls translates the model's tool_use JSON into OpenAI's
+// tool_calls[] shape. Names/inputs come straight through (the schema
+// already used Anthropic's spelling), only the envelope changes.
+func openAIToolCalls(calls []common.ToolCallJSON) []ToolCall {
+	out := make([]ToolCall, len(calls))
+	for i, c := range calls {
+		out[i].ID = c.ID
+		if out[i].ID == "" {
+			out[i].ID = fmt.Sprintf("call_%d", i)
+		}
+		out[i].Type = "function"
+		out[i].Function.Name = c.Name
+		out[i].Function.Arguments = string(c.Input)
+	}
+	return out
+}
+
 // stream handles the SSE path.
 func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	reqID, model, agentMode, thinking, text, dlogDir string) {
+	reqID, model, agentMode, thinking, text string,
+	atts []chat.Attachment, conversationID, dlogDir string) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -229,24 +369,17 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	})
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.Bridge.RunTurn(ctx, chat.TurnOpts{
-		Text:           text,
-		AgentMode:      agentMode,
-		ThinkingEffort: thinking,
-		UserTimezone:   h.Cfg.Quick.UserTimezone,
-		UserLocale:     h.Cfg.Quick.UserLocale,
-		Title:          "quick2api " + reqID,
-		OnEvent: func(ev chat.TurnEvent) {
-			frames.OnEvent(ev)
-			if ev.Kind == "delta" {
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
+		conversationID, frames,
+		func(delta string) {
+			if h.Tools == nil {
 				emit(completion{
 					ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
 					Created: time.Now().Unix(), Model: model,
-					Choices: []choice{{Index: 0, Delta: &MessageOut{Content: ev.Text}}},
+					Choices: []choice{{Index: 0, Delta: &MessageOut{Content: delta}}},
 				})
 			}
-		},
-	})
+		})
 	frames.Write(h.Debug, dlogDir)
 	if err != nil {
 		h.finishDebug(dlogDir, nil, err)
@@ -261,14 +394,27 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	}
 	result := res
 
-	// final chunk: finish_reason + usage (OpenAI convention puts usage on a
-	// dedicated final chunk when include_usage is requested; we always send
-	// it — the payload is small and clients tolerate it).
+	// Tool-loop mode ran ahead of SSE; emit the final text as one delta.
+	if h.Tools != nil {
+		emit(completion{
+			ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
+			Created: time.Now().Unix(), Model: model,
+			Choices: []choice{{Index: 0, Delta: &MessageOut{Content: result.Text}}},
+		})
+	}
+
 	fin := completion{
 		ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
 		Created: time.Now().Unix(), Model: util.Or(result.ResolvedModel, model),
 		Choices: []choice{{Index: 0, Delta: &MessageOut{}, FinishReason: result.FinishReason}},
 		Usage:   mapUsage(result.Usage),
+	}
+	if calls, ok := common.ParseToolCallsJSON(result.Text); ok && len(calls) > 0 {
+		fin.Choices[0].FinishReason = "tool_calls"
+		fin.Choices[0].Delta = &MessageOut{
+			Role:      "assistant",
+			ToolCalls: openAIToolCalls(calls),
+		}
 	}
 	emit(fin)
 	fmt.Fprint(w, "data: [DONE]\n\n")
@@ -276,7 +422,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	h.finishDebug(dlogDir, &completion{
 		ID: "chatcmpl-" + reqID, Object: "chat.completion",
 		Created: time.Now().Unix(), Model: util.Or(result.ResolvedModel, model),
-		Choices: []choice{{Index: 0, Message: &MessageOut{Role: "assistant", Content: result.Text}, FinishReason: result.FinishReason}},
+		Choices: []choice{{Index: 0, Message: messageOutFor(result.Text), FinishReason: fin.Choices[0].FinishReason}},
 		Usage: mapUsage(result.Usage),
 	}, nil)
 }
@@ -324,16 +470,22 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 // ---------- helpers ----------
 
 // renderTranscript flattens OpenAI messages into the single text the
-// upstream user_message carries. Quick's agent tracks its own threads, so
-// history must be explicit — roles render as plain labels.
-func renderTranscript(msgs []Message) (string, error) {
+// upstream user_message carries, plus any binary parts (image_url/file)
+// converted to chat.Attachment for the out-of-band upload path.
+func renderTranscript(msgs []Message) (text string, atts []chat.Attachment, err error) {
 	var b strings.Builder
 	for _, m := range msgs {
-		content, err := flattenContent(m.Content)
-		if err != nil {
-			return "", fmt.Errorf("%s message: %w", m.Role, err)
+		// assistant tool_calls → render into transcript so the model sees
+		// its own history.
+		for _, tc := range m.ToolCalls {
+			fmt.Fprintf(&b, "ToolCall %s(%s)\n\n", tc.Function.Name, tc.Function.Arguments)
 		}
-		if content == "" {
+		content, mAtts, err := flattenContent(m.Content)
+		if err != nil {
+			return "", nil, fmt.Errorf("%s message: %w", m.Role, err)
+		}
+		atts = append(atts, mAtts...)
+		if content == "" && len(m.ToolCalls) == 0 && len(mAtts) == 0 {
 			continue
 		}
 		label := ""
@@ -349,28 +501,31 @@ func renderTranscript(msgs []Message) (string, error) {
 		default:
 			label = strings.Title(m.Role)
 		}
-		fmt.Fprintf(&b, "%s: %s\n\n", label, content)
+		if content != "" {
+			fmt.Fprintf(&b, "%s: %s\n\n", label, content)
+		}
 	}
 	out := strings.TrimSpace(b.String())
-	if out == "" {
-		return "", errors.New("messages rendered to empty text")
+	if out == "" && len(atts) == 0 {
+		return "", nil, errors.New("messages rendered to empty text")
 	}
-	return out, nil
+	return out, atts, nil
 }
 
 // flattenContent accepts either a string or an array of content parts.
-// Only text-bearing parts are supported in v1.
-func flattenContent(raw json.RawMessage) (string, error) {
+// image_url/file parts convert to chat.Attachment for the upload path;
+// the caller ships them out-of-band instead of inlining.
+func flattenContent(raw json.RawMessage) (text string, atts []chat.Attachment, err error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return "", nil
+		return "", nil, nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
+		return s, nil, nil
 	}
 	var parts []map[string]any
 	if err := json.Unmarshal(raw, &parts); err != nil {
-		return "", fmt.Errorf("content must be a string or an array of parts")
+		return "", nil, fmt.Errorf("content must be a string or an array of parts")
 	}
 	var b strings.Builder
 	for _, p := range parts {
@@ -384,11 +539,161 @@ func flattenContent(raw json.RawMessage) (string, error) {
 			if v, ok := p["refusal"].(string); ok {
 				b.WriteString("[refusal] " + v)
 			}
+		case "image_url":
+			a, aerr := attachmentFromImageURLPart(p)
+			if aerr != nil {
+				return "", nil, aerr
+			}
+			if a != nil {
+				atts = append(atts, *a)
+			}
+		case "file":
+			a, aerr := attachmentFromFilePart(p)
+			if aerr != nil {
+				return "", nil, aerr
+			}
+			if a != nil {
+				atts = append(atts, *a)
+			}
+		case "input_audio":
+			return "", nil, fmt.Errorf("input_audio unsupported: Quick has no audio channel")
 		default:
-			return "", fmt.Errorf("unsupported content part %q: v1 is text-only", t)
+			return "", nil, fmt.Errorf("unsupported content part %q", t)
 		}
 	}
-	return b.String(), nil
+	return b.String(), atts, nil
+}
+
+// attachmentFromImageURLPart converts an OpenAI `image_url` content part
+// into a chat.Attachment. image_url:{url:"data:…"} decodes inline; http(s)
+// URLs are fetched here so the bytes ride the same out-of-band channel.
+func attachmentFromImageURLPart(p map[string]any) (*chat.Attachment, error) {
+	raw, _ := p["image_url"].(map[string]any)
+	u, _ := raw["url"].(string)
+	if u == "" {
+		return nil, errors.New("image_url missing url")
+	}
+	return urlToAttachment(u, "image")
+}
+
+// attachmentFromFilePart converts an OpenAI `file` content part into a
+// chat.Attachment. file:{file_data:"data:…",filename:"name"} or a plain
+// http(s) URL.
+func attachmentFromFilePart(p map[string]any) (*chat.Attachment, error) {
+	raw, _ := p["file"].(map[string]any)
+	data, _ := raw["file_data"].(string)
+	name, _ := raw["filename"].(string)
+	if name == "" {
+		name = "file.bin"
+	}
+	if data != "" {
+		if strings.HasPrefix(data, "data:") {
+			a, err := urlToAttachment(data, "file")
+			if err != nil {
+				return nil, err
+			}
+			a.Name = name
+			return a, nil
+		}
+		return nil, errors.New("file.file_data must be a data: URL")
+	}
+	u, _ := raw["url"].(string)
+	if u == "" {
+		return nil, errors.New("file missing file_data or url")
+	}
+	a, err := urlToAttachment(u, "file")
+	if err != nil {
+		return nil, err
+	}
+	a.Name = name
+	return a, nil
+}
+
+// urlToAttachment decodes a data: URL or fetches an http(s) URL into an
+// Attachment. kind is "image" or "file" — used to pick the fallback
+// name when the source doesn't say one.
+func urlToAttachment(u, kind string) (*chat.Attachment, error) {
+	if strings.HasPrefix(u, "data:") {
+		comma := strings.IndexByte(u, ',')
+		if comma < 0 {
+			return nil, errors.New("bad data: URL")
+		}
+		header, payload := u[5:comma], u[comma+1:]
+		mime := "application/octet-stream"
+		if i := strings.IndexByte(header, ';'); i >= 0 {
+			mime = header[:i]
+		}
+		var raw []byte
+		var err error
+		if strings.HasSuffix(header, ";base64") {
+			raw, err = base64.StdEncoding.DecodeString(payload)
+		} else {
+			raw, err = urlDecode(payload)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("decode data: URL: %w", err)
+		}
+		return &chat.Attachment{Name: nameFor(mime, kind), MimeType: mime, Data: raw}, nil
+	}
+	cli := &http.Client{Timeout: 30 * time.Second}
+	resp, err := cli.Get(u) //nolint:gosec // client-supplied URL is the point
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("fetch %s: status %d", u, resp.StatusCode)
+	}
+	mime := resp.Header.Get("Content-Type")
+	if i := strings.IndexByte(mime, ';'); i >= 0 {
+		mime = strings.TrimSpace(mime[:i])
+	}
+	const maxBytes = 20 << 20
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxBytes {
+		return nil, fmt.Errorf("fetch %s: >%d bytes", u, maxBytes)
+	}
+	return &chat.Attachment{Name: nameFor(mime, kind), MimeType: mime, Data: raw}, nil
+}
+
+// nameFor picks a sensible filename for a mime type so the upload
+// channel gets something meaningful.
+func nameFor(mime, kind string) string {
+	ext := "bin"
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		ext = strings.TrimPrefix(mime, "image/")
+	case mime == "application/pdf":
+		ext = "pdf"
+	case strings.HasPrefix(mime, "text/"):
+		ext = "txt"
+	case mime == "application/json":
+		ext = "json"
+	}
+	return kind + "." + ext
+}
+
+// urlDecode handles percent-encoded data: URLs (rare — most clients
+// send base64, but the spec allows it).
+func urlDecode(s string) ([]byte, error) {
+	// percent-decoding by hand avoids pulling net/url just for this.
+	var out []byte
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			v, err := strconv.ParseUint(s[i+1:i+3], 16, 8)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, byte(v))
+			i += 2
+		} else {
+			out = append(out, s[i])
+		}
+	}
+	return out, nil
 }
 
 func mapUsage(u *chat.TurnUsage) *usage {
