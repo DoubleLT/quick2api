@@ -5,7 +5,12 @@
 package session
 
 // Session is the decoded /auth/sncs-session response.
+//
+// Two field groups: the json-tagged block mirrors the wire contract (never
+// rename tags — they are the API surface); the json:"-" block is runtime
+// state filled locally by FetchSession and absent from file-loaded sessions.
 type Session struct {
+	// --- wire fields (the outpost's JSON contract) ---
 	IDToken           string  `json:"id_token"`
 	ActorARN          string  `json:"actor_arn"`
 	WSHost            string  `json:"ws_host"`
@@ -21,16 +26,16 @@ type Session struct {
 	UsableUntil       float64 `json:"usable_until"`
 	AccountName       string  `json:"account_name"`
 
+	// --- runtime fields (filled by FetchSession, not on the wire) ---
+
 	// OutpostID is the registered outpost UUID (/local/list_tools), NOT in
 	// the sncs-session JSON. The chat WSS rejects arbitrary outpostIds —
-	// it must be this server's own device id. Filled by FetchSession;
-	// empty for file-loaded sessions.
+	// it must be this server's own device id. Empty for file-loaded sessions.
 	OutpostID string `json:"-"`
 
 	// OutpostURL + OutpostToken identify the spawned/attached outpost that
-	// produced this session. Filled by FetchSession; empty for
-	// file-loaded sessions. The cloud attachment path uses TenantURL,
-	// not this loopback.
+	// produced this session. Empty for file-loaded sessions. The cloud
+	// attachment path uses TenantURL, not this loopback.
 	OutpostURL   string `json:"-"`
 	OutpostToken string `json:"-"`
 }

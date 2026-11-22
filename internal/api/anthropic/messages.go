@@ -22,10 +22,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kilbertert/quick2api/internal/api/common"
 	"github.com/kilbertert/quick2api/internal/bridge"
 	"github.com/kilbertert/quick2api/internal/chat"
 	"github.com/kilbertert/quick2api/internal/config"
 	"github.com/kilbertert/quick2api/internal/debuglog"
+	"github.com/kilbertert/quick2api/internal/util"
 )
 
 // Handler serves Anthropic-compatible endpoints.
@@ -90,7 +92,7 @@ type anthropicMessage struct {
 
 // Messages handles POST /v1/messages.
 func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
-	reqID := reqID(r)
+	reqID := common.ReqID(r)
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "invalid_request_error", "use POST")
 		return
@@ -111,21 +113,18 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.Sem != nil {
-		select {
-		case h.Sem <- struct{}{}:
-			defer func() { <-h.Sem }()
-		case <-r.Context().Done():
-			return
-		default:
+	release, ok := common.Acquire(r.Context(), h.Sem)
+	if !ok {
+		if r.Context().Err() == nil {
 			writeErr(w, http.StatusTooManyRequests, "rate_limit_error", "local concurrency limit reached")
-			return
 		}
+		return
 	}
+	defer release()
 
 	model := req.Model
 	if model == "" {
-		model = firstModel(h.Cfg)
+		model = common.FirstModel(h.Cfg)
 	}
 	agentMode := h.Cfg.AgentModeFor(model)
 	thinking := h.Cfg.Quick.ThinkingEffort
@@ -158,10 +157,7 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 	reqID, model, agentMode, thinking, text, dlogDir string) {
 
-	var frames []json.RawMessage
-	if h.Debug.LogFrames {
-		frames = make([]json.RawMessage, 0, 64)
-	}
+	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.Bridge.RunTurn(ctx, chat.TurnOpts{
 		Text:           text,
 		AgentMode:      agentMode,
@@ -169,17 +165,11 @@ func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 		UserTimezone:   h.Cfg.Quick.UserTimezone,
 		UserLocale:     h.Cfg.Quick.UserLocale,
 		Title:          "quick2api " + reqID,
-		OnEvent: func(ev chat.TurnEvent) {
-			if h.Debug.LogFrames && ev.Kind == "frame" && ev.Frame != nil {
-				if raw, merr := json.Marshal(ev.Frame); merr == nil {
-					frames = append(frames, raw)
-				}
-			}
-		},
+		OnEvent:        frames.OnEvent,
 	})
 	// Always write frames before returning — the error path is exactly
 	// where they are needed to see the upstream's real error payload.
-	h.Debug.Write(dlogDir, "01-frames", frames)
+	frames.Write(h.Debug, dlogDir)
 	if err != nil {
 		h.finishDebug(dlogDir, nil, err)
 		writeUpstream(w, err)
@@ -191,7 +181,7 @@ func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 		ID:      "msg_" + reqID,
 		Type:    "message",
 		Role:    "assistant",
-		Model:   orElse(res.ResolvedModel, model),
+		Model:   util.Or(res.ResolvedModel, model),
 		Content: content,
 		Usage:   mapUsage(res.Usage),
 	}
@@ -255,6 +245,7 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	}
 	start()
 
+	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.Bridge.RunTurn(ctx, chat.TurnOpts{
 		Text:           text,
 		AgentMode:      agentMode,
@@ -263,16 +254,16 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 		UserLocale:     h.Cfg.Quick.UserLocale,
 		Title:          "quick2api " + reqID,
 		OnEvent: func(ev chat.TurnEvent) {
+			frames.OnEvent(ev)
 			if ev.Kind == "delta" && ev.Text != "" {
 				emit("content_block_delta", map[string]any{
 					"index": 0,
 					"delta": map[string]any{"type": "text_delta", "text": ev.Text},
 				})
-			} else if h.Debug.LogFrames && ev.Kind == "frame" && ev.Frame != nil {
-				h.Debug.Write(dlogDir, "01-frames", ev.Frame)
 			}
 		},
 	})
+	frames.Write(h.Debug, dlogDir)
 
 	// close the text block even on error — clients expect a terminated stream
 	emit("content_block_stop", map[string]any{"index": 0})
@@ -326,7 +317,7 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	emit("message_stop", map[string]any{})
 	h.finishDebug(dlogDir, &anthropicMessage{
 		ID: msgID, Type: "message", Role: "assistant",
-		Model: orElse(res.ResolvedModel, model), Content: content,
+		Model: util.Or(res.ResolvedModel, model), Content: content,
 		StopReason: stopReason, Usage: u,
 	}, nil)
 }
@@ -457,7 +448,7 @@ func parseToolCalls(text string) []ContentBlock {
 	if json.Unmarshal([]byte(trimmed), &blk) == nil &&
 		blk.Type == "tool_use" && blk.Name != "" && len(blk.Input) > 0 {
 		if blk.ID == "" {
-			blk.ID = "toolu_" + reqID(nil)
+			blk.ID = common.NewID("toolu")
 		}
 		return []ContentBlock{blk}
 	}
@@ -477,23 +468,17 @@ func mapUsage(u *chat.TurnUsage) anthropicUsage {
 }
 
 func writeUpstream(w http.ResponseWriter, err error) {
-	var ue *chat.UpstreamError
-	if errors.As(err, &ue) {
-		switch ue.Code {
-		case "unauthenticated", "token_expired":
-			writeErr(w, http.StatusUnauthorized, "authentication_error", ue.Message)
-		case "rate_limited", "throttled":
-			writeErr(w, http.StatusTooManyRequests, "rate_limit_error", ue.Message)
-		default:
-			writeErr(w, http.StatusBadGateway, "api_error", ue.Message)
-		}
-		return
+	status, kind, msg := common.UpstreamError(err)
+	typ := "api_error"
+	switch kind {
+	case common.KindUnauthenticated:
+		typ = "authentication_error"
+	case common.KindRateLimited:
+		typ = "rate_limit_error"
+	case common.KindTimeout:
+		typ = "timeout"
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		writeErr(w, http.StatusGatewayTimeout, "timeout", err.Error())
-		return
-	}
-	writeErr(w, http.StatusBadGateway, "api_error", err.Error())
+	writeErr(w, status, typ, msg)
 }
 
 func writeErr(w http.ResponseWriter, status int, typ, msg string) {
@@ -505,25 +490,4 @@ func writeErr(w http.ResponseWriter, status int, typ, msg string) {
 	})
 }
 
-func reqID(r *http.Request) string {
-	if r != nil {
-		if v := r.Header.Get("X-Request-Id"); v != "" {
-			return v
-		}
-	}
-	return fmt.Sprintf("q2a-%d", time.Now().UnixNano())
-}
 
-func firstModel(c *config.Config) string {
-	for k := range c.Quick.AgentModes {
-		return k
-	}
-	return "quick"
-}
-
-func orElse(v, def string) string {
-	if v == "" {
-		return def
-	}
-	return v
-}

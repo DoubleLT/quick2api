@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/kilbertert/quick2api/internal/util"
 )
 
 // SpawnOpts parameterizes Spawn.
@@ -111,7 +113,7 @@ func Spawn(ctxDone <-chan struct{}, opts SpawnOpts) (*Outpost, error) {
 		"--port", fmt.Sprint(port),
 	)
 	cmd.Dir = opts.WorkDir
-	cmd.Env = append(os.Environ(), "QUICKWORK_BUILD_STAGE="+envOr(opts.BuildStage, "prod"))
+	cmd.Env = append(os.Environ(), "QUICKWORK_BUILD_STAGE="+util.Or(opts.BuildStage, "prod"))
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	setSpawnAttrs(cmd)
@@ -176,7 +178,7 @@ func (o *Outpost) FetchSession() (*Session, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("sncs-session: status %d: %s", resp.StatusCode, truncate(string(body), 200))
+		return nil, fmt.Errorf("sncs-session: status %d: %s", resp.StatusCode, util.Trunc(string(body), 200))
 	}
 	var s Session
 	if err := json.Unmarshal(body, &s); err != nil {
@@ -251,16 +253,4 @@ func freePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-func envOr(v, def string) string {
-	if v == "" {
-		return def
-	}
-	return v
-}
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
-}

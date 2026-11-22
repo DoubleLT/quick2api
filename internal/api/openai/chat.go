@@ -13,10 +13,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kilbertert/quick2api/internal/api/common"
 	"github.com/kilbertert/quick2api/internal/bridge"
 	"github.com/kilbertert/quick2api/internal/chat"
 	"github.com/kilbertert/quick2api/internal/config"
 	"github.com/kilbertert/quick2api/internal/debuglog"
+	"github.com/kilbertert/quick2api/internal/util"
 )
 
 // Handler serves OpenAI-compatible endpoints.
@@ -92,7 +94,7 @@ type usage struct {
 
 // ChatCompletions handles POST /v1/chat/completions.
 func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
-	reqID := reqID(r)
+	reqID := common.ReqID(r)
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST", "")
 		return
@@ -121,22 +123,19 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// concurrency ceiling
-	if h.Sem != nil {
-		select {
-		case h.Sem <- struct{}{}:
-			defer func() { <-h.Sem }()
-		case <-r.Context().Done():
-			return
-		default:
+	release, ok := common.Acquire(r.Context(), h.Sem)
+	if !ok {
+		if r.Context().Err() == nil {
 			writeError(w, http.StatusTooManyRequests, "rate_limit_error",
 				"local concurrency limit reached", "")
-			return
 		}
+		return
 	}
+	defer release()
 
 	model := req.Model
 	if model == "" {
-		model = firstModel(h.Cfg)
+		model = common.FirstModel(h.Cfg)
 	}
 	agentMode := h.Cfg.AgentModeFor(model)
 	thinking := h.Cfg.Quick.ThinkingEffort
@@ -164,10 +163,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.Context,
 	reqID, model, agentMode, thinking, text, dlogDir string) {
 
-	var frames []json.RawMessage
-	if h.Debug.LogFrames {
-		frames = make([]json.RawMessage, 0, 64)
-	}
+	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.Bridge.RunTurn(ctx, chat.TurnOpts{
 		Text:           text,
 		AgentMode:      agentMode,
@@ -175,25 +171,19 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.C
 		UserTimezone:   h.Cfg.Quick.UserTimezone,
 		UserLocale:     h.Cfg.Quick.UserLocale,
 		Title:          "quick2api " + reqID,
-		OnEvent: func(ev chat.TurnEvent) {
-			if h.Debug.LogFrames && ev.Kind == "frame" && ev.Frame != nil {
-				if raw, err := json.Marshal(ev.Frame); err == nil {
-					frames = append(frames, raw)
-				}
-			}
-		},
+		OnEvent:        frames.OnEvent,
 	})
+	frames.Write(h.Debug, dlogDir)
 	if err != nil {
 		h.finishDebug(dlogDir, nil, err)
 		writeUpstreamError(w, err)
 		return
 	}
-	h.Debug.Write(dlogDir, "01-frames", frames)
 	out := completion{
 		ID:      "chatcmpl-" + reqID,
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   orElse(res.ResolvedModel, model),
+		Model:   util.Or(res.ResolvedModel, model),
 		Choices: []choice{{
 			Index:        0,
 			Message:      &MessageOut{Role: "assistant", Content: res.Text},
@@ -238,6 +228,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 		Choices: []choice{{Index: 0, Delta: &MessageOut{Role: "assistant"}}},
 	})
 
+	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.Bridge.RunTurn(ctx, chat.TurnOpts{
 		Text:           text,
 		AgentMode:      agentMode,
@@ -246,20 +237,17 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 		UserLocale:     h.Cfg.Quick.UserLocale,
 		Title:          "quick2api " + reqID,
 		OnEvent: func(ev chat.TurnEvent) {
-			switch ev.Kind {
-			case "delta":
+			frames.OnEvent(ev)
+			if ev.Kind == "delta" {
 				emit(completion{
 					ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
 					Created: time.Now().Unix(), Model: model,
 					Choices: []choice{{Index: 0, Delta: &MessageOut{Content: ev.Text}}},
 				})
-			case "frame":
-				if h.Debug.LogFrames && ev.Frame != nil {
-					h.Debug.Write(dlogDir, "01-frames", ev.Frame)
-				}
 			}
 		},
 	})
+	frames.Write(h.Debug, dlogDir)
 	if err != nil {
 		h.finishDebug(dlogDir, nil, err)
 		// OpenAI streams still terminate with [DONE]; send an error event
@@ -278,7 +266,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	// it — the payload is small and clients tolerate it).
 	fin := completion{
 		ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
-		Created: time.Now().Unix(), Model: orElse(result.ResolvedModel, model),
+		Created: time.Now().Unix(), Model: util.Or(result.ResolvedModel, model),
 		Choices: []choice{{Index: 0, Delta: &MessageOut{}, FinishReason: result.FinishReason}},
 		Usage:   mapUsage(result.Usage),
 	}
@@ -287,7 +275,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	fl.Flush()
 	h.finishDebug(dlogDir, &completion{
 		ID: "chatcmpl-" + reqID, Object: "chat.completion",
-		Created: time.Now().Unix(), Model: orElse(result.ResolvedModel, model),
+		Created: time.Now().Unix(), Model: util.Or(result.ResolvedModel, model),
 		Choices: []choice{{Index: 0, Message: &MessageOut{Role: "assistant", Content: result.Text}, FinishReason: result.FinishReason}},
 		Usage: mapUsage(result.Usage),
 	}, nil)
@@ -314,7 +302,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 		ids[m] = struct{}{}
 	}
 	if len(ids) == 0 {
-		ids[firstModel(h.Cfg)] = struct{}{}
+		ids[common.FirstModel(h.Cfg)] = struct{}{}
 	}
 	list := make([]map[string]any, 0, len(ids))
 	for id := range ids {
@@ -420,26 +408,23 @@ func mapUsage(u *chat.TurnUsage) *usage {
 }
 
 func writeUpstreamError(w http.ResponseWriter, err error) {
+	status, kind, msg := common.UpstreamError(err)
+	typ := "upstream_error"
+	switch kind {
+	case common.KindUnauthenticated:
+		typ = "authentication_error"
+	case common.KindRateLimited:
+		typ = "rate_limit_error"
+	case common.KindTimeout:
+		typ = "timeout"
+	}
+	// keep the upstream's own code in the "code" field when present.
 	var ue *chat.UpstreamError
+	code := ""
 	if errors.As(err, &ue) {
-		code := "upstream_error"
-		status := http.StatusBadGateway
-		switch ue.Code {
-		case "unauthenticated", "token_expired":
-			status = http.StatusUnauthorized
-			code = "authentication_error"
-		case "rate_limited", "throttled":
-			status = http.StatusTooManyRequests
-			code = "rate_limit_error"
-		}
-		writeError(w, status, code, ue.Message, ue.Code)
-		return
+		code = ue.Code
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		writeError(w, http.StatusGatewayTimeout, "timeout", err.Error(), "")
-		return
-	}
-	writeError(w, http.StatusBadGateway, "upstream_error", err.Error(), "")
+	writeError(w, status, typ, msg, code)
 }
 
 func writeError(w http.ResponseWriter, status int, typ, msg, code string) {
@@ -450,25 +435,4 @@ func writeError(w http.ResponseWriter, status int, typ, msg, code string) {
 			"message": msg, "type": typ, "code": code, "param": nil,
 		},
 	})
-}
-
-func reqID(r *http.Request) string {
-	if v := r.Header.Get("X-Request-Id"); v != "" {
-		return v
-	}
-	return fmt.Sprintf("q2a-%d", time.Now().UnixNano())
-}
-
-func firstModel(c *config.Config) string {
-	for k := range c.Quick.AgentModes {
-		return k
-	}
-	return "quick"
-}
-
-func orElse(v, def string) string {
-	if v != "" {
-		return v
-	}
-	return def
 }
