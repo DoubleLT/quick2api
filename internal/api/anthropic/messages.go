@@ -15,9 +15,11 @@ package anthropic
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ import (
 	"github.com/kilbertert/quick2api/internal/chat"
 	"github.com/kilbertert/quick2api/internal/config"
 	"github.com/kilbertert/quick2api/internal/debuglog"
+	"github.com/kilbertert/quick2api/internal/tools"
 	"github.com/kilbertert/quick2api/internal/util"
 )
 
@@ -36,6 +39,9 @@ type Handler struct {
 	Cfg    *config.Config
 	Debug  *debuglog.Logger
 	Sem    chan struct{}
+	// Tools is the server-side executor; nil = advisory mode (schemas go
+	// in the prompt, tool_use blocks come back to the caller as-is).
+	Tools tools.Executor
 }
 
 // ---------- request/response types (subset of the Messages schema) ----------
@@ -49,11 +55,16 @@ type ContentBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+	Source    json.RawMessage `json:"source,omitempty"` // image/document source
 }
 
 type Message struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+	// ID carries the client-supplied thread/conversation id when the
+	// client puts one there (Claude Code uses it for session pinning).
+	ID       string          `json:"id,omitempty"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 type MessagesRequest struct {
@@ -103,7 +114,7 @@ func (h *Handler) CountTokens(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error())
 		return
 	}
-	text, err := renderPrompt(&req)
+	text, _, err := renderPrompt(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -131,7 +142,7 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	text, err := renderPrompt(&req)
+	text, atts, err := renderPrompt(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -161,36 +172,65 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Thread continuity: honor the client's conversation id when supplied
+	// (Claude Code sends thread/session ids through X-Session-Id or the
+	// first message's client-supplied id). Falls back to a fresh conv each
+	// request — the bridge drops stale conns automatically.
+	conversationID := conversationIDOf(r, &req)
+
 	dlogDir := h.Debug.Dir(reqID)
 	h.Debug.Write(dlogDir, "00-request", map[string]any{
 		"id": reqID, "model": model, "agent_mode": agentMode,
 		"stream": req.Stream, "messages": len(req.Messages),
+		"conversation": conversationID,
 	})
 
 	ctx, cancel := context.WithTimeout(r.Context(), h.Cfg.TurnTimeout())
 	defer cancel()
 
 	if req.Stream {
-		h.stream(w, ctx, reqID, model, agentMode, thinking, text, dlogDir)
+		h.stream(w, ctx, reqID, model, agentMode, thinking, text, atts, conversationID, dlogDir)
 		return
 	}
-	h.complete(w, ctx, reqID, model, agentMode, thinking, text, dlogDir)
+	h.complete(w, ctx, reqID, model, agentMode, thinking, text, atts, conversationID, dlogDir)
+}
+
+// conversationIDOf resolves the client-supplied conversation id. Sources,
+// in order: the `X-Conversation-Id`/`X-Session-Id` header, then the
+// first message's top-level `id` (Anthropic clients put a thread/convo
+// id there), then metadata.user_id. Returns "" when none is usable —
+// the bridge then starts a fresh upstream session per request.
+func conversationIDOf(r *http.Request, req *MessagesRequest) string {
+	if id := strings.TrimSpace(r.Header.Get("X-Conversation-Id")); id != "" {
+		return id
+	}
+	if id := strings.TrimSpace(r.Header.Get("X-Session-Id")); id != "" {
+		return id
+	}
+	for _, m := range req.Messages {
+		if id := strings.TrimSpace(m.ID); id != "" {
+			return id
+		}
+	}
+	if len(req.Metadata) > 0 {
+		var meta struct {
+			UserID string `json:"user_id"`
+		}
+		if json.Unmarshal(req.Metadata, &meta) == nil && meta.UserID != "" {
+			return meta.UserID
+		}
+	}
+	return ""
 }
 
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
-	reqID, model, agentMode, thinking, text, dlogDir string) {
+	reqID, model, agentMode, thinking, text string,
+	atts []chat.Attachment, conversationID, dlogDir string) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.Bridge.RunTurn(ctx, chat.TurnOpts{
-		Text:           text,
-		AgentMode:      agentMode,
-		ThinkingEffort: thinking,
-		UserTimezone:   h.Cfg.Quick.UserTimezone,
-		UserLocale:     h.Cfg.Quick.UserLocale,
-		Title:          "quick2api " + reqID,
-		OnEvent:        frames.OnEvent,
-	})
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
+		conversationID, frames, nil)
 	// Always write frames before returning — the error path is exactly
 	// where they are needed to see the upstream's real error payload.
 	frames.Write(h.Debug, dlogDir)
@@ -219,13 +259,90 @@ func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// runAgent performs the tool-use loop: sends the prompt, executes any
+// tool_use blocks the model emits via h.Tools, and feeds the results back
+// until the model stops calling tools or MaxToolRounds hits. Returns the
+// final TurnResult — the last upstream turn's text — so the caller maps
+// it to Anthropic blocks exactly like a single-shot call.
+//
+// When h.Tools is nil this is a one-shot RunTurn (advisory mode).
+func (h *Handler) runAgent(ctx context.Context,
+	reqID, agentMode, thinking, text string,
+	atts []chat.Attachment, conversationID string,
+	frames *common.Frames, onDelta func(string)) (*chat.TurnResult, error) {
+
+	maxRounds := h.Cfg.Tools.MaxToolRounds
+	if maxRounds <= 0 {
+		maxRounds = 4
+	}
+	if h.Tools == nil {
+		maxRounds = 1
+	}
+
+	prompt := text
+	var res *chat.TurnResult
+	var err error
+	for round := 0; round < maxRounds; round++ {
+		res, err = h.Bridge.RunTurn(ctx, chat.TurnOpts{
+			Text:           prompt,
+			AgentMode:      agentMode,
+			ThinkingEffort: thinking,
+			UserTimezone:   h.Cfg.Quick.UserTimezone,
+			UserLocale:     h.Cfg.Quick.UserLocale,
+			Title:          "quick2api " + reqID,
+			ConversationID: conversationID,
+			Attachments:    atts,
+			OnEvent: func(ev chat.TurnEvent) {
+				frames.OnEvent(ev)
+				if onDelta != nil && ev.Kind == "delta" && ev.Text != "" {
+					onDelta(ev.Text)
+				}
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		blocks := parseToolCalls(res.Text)
+		var calls []ContentBlock
+		for _, b := range blocks {
+			if b.Type == "tool_use" {
+				calls = append(calls, b)
+			}
+		}
+		if len(calls) == 0 || h.Tools == nil {
+			return res, nil
+		}
+
+		var next strings.Builder
+		fmt.Fprintf(&next, "Assistant: %s\n\n", res.Text)
+		for _, c := range calls {
+			result, isErr := h.Tools.Exec(ctx, c.Name, c.Input)
+			label := "ToolResult"
+			if isErr {
+				label += " (error)"
+			}
+			fmt.Fprintf(&next, "%s for %s(%s): %s\n\n",
+				label, c.Name, string(c.Input), result)
+		}
+		prompt = strings.TrimSpace(next.String())
+		if prompt == "" {
+			return res, nil
+		}
+		// Subsequent turns don't need the attachments again.
+		atts = nil
+	}
+	return res, nil
+}
+
 // stream emits Anthropic SSE: message_start → content_block_start →
 // content_block_delta(text) ×N → content_block_stop → message_delta →
 // message_stop. Tool-use blocks can't stream (the input arrives whole
 // inside the text); when the finished text parses as a tool call we
 // still emit it as a single content_block — legal per the spec.
 func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
-	reqID, model, agentMode, thinking, text, dlogDir string) {
+	reqID, model, agentMode, thinking, text string,
+	atts []chat.Attachment, conversationID, dlogDir string) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -270,24 +387,28 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	start()
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.Bridge.RunTurn(ctx, chat.TurnOpts{
-		Text:           text,
-		AgentMode:      agentMode,
-		ThinkingEffort: thinking,
-		UserTimezone:   h.Cfg.Quick.UserTimezone,
-		UserLocale:     h.Cfg.Quick.UserLocale,
-		Title:          "quick2api " + reqID,
-		OnEvent: func(ev chat.TurnEvent) {
-			frames.OnEvent(ev)
-			if ev.Kind == "delta" && ev.Text != "" {
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
+		conversationID, frames,
+		func(delta string) {
+			// Advisory mode only: stream text deltas as they arrive.
+			// When h.Tools is set the loop runs ahead of SSE so the
+			// client gets a single final delta at content_block_stop.
+			if h.Tools == nil {
 				emit("content_block_delta", map[string]any{
 					"index": 0,
-					"delta": map[string]any{"type": "text_delta", "text": ev.Text},
+					"delta": map[string]any{"type": "text_delta", "text": delta},
 				})
 			}
-		},
-	})
+		})
 	frames.Write(h.Debug, dlogDir)
+
+	if err == nil && res != nil && h.Tools != nil {
+		// Tool-loop mode ran ahead of SSE; emit the final text as one delta.
+		emit("content_block_delta", map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": res.Text},
+		})
+	}
 
 	// close the text block even on error — clients expect a terminated stream
 	emit("content_block_stop", map[string]any{"index": 0})
@@ -360,10 +481,14 @@ func (h *Handler) finishDebug(dir string, out any, runErr error) {
 // ---------- helpers ----------
 
 // renderPrompt flattens the Anthropic request into the single text the
-// upstream user_message carries. System becomes a leading "System:"
-// block; tool declarations become an instruction block so the agent can
-// see its own tools' schemas.
-func renderPrompt(req *MessagesRequest) (string, error) {
+// upstream user_message carries, plus any binary payload blocks (images /
+// documents) converted to chat.Attachment for the out-of-band channel.
+//
+// When `withTools` is false the `tools` array is left out of the text —
+// callers that run a real tool loop (executor) still want the schemas in
+// the prompt, callers that just pass the advisory contract through prefer
+// to keep them anyway; both produce identical rendered text today.
+func renderPrompt(req *MessagesRequest) (text string, atts []chat.Attachment, err error) {
 	var b strings.Builder
 
 	// system: string | [ {type:"text",text:…} ]
@@ -410,7 +535,7 @@ func renderPrompt(req *MessagesRequest) (string, error) {
 		}
 		var blocks []ContentBlock
 		if err := json.Unmarshal(m.Content, &blocks); err != nil {
-			return "", fmt.Errorf("%s message: content must be a string or blocks", m.Role)
+			return "", nil, fmt.Errorf("%s message: content must be a string or blocks", m.Role)
 		}
 		for _, bl := range blocks {
 			switch bl.Type {
@@ -420,6 +545,22 @@ func renderPrompt(req *MessagesRequest) (string, error) {
 					label = "Assistant"
 				}
 				fmt.Fprintf(&b, "%s: %s\n\n", label, bl.Text)
+			case "image":
+				a, aerr := attachmentFromImageBlock(&bl)
+				if aerr != nil {
+					return "", nil, fmt.Errorf("image block: %w", aerr)
+				}
+				if a != nil {
+					atts = append(atts, *a)
+				}
+			case "document":
+				a, aerr := attachmentFromDocumentBlock(&bl)
+				if aerr != nil {
+					return "", nil, fmt.Errorf("document block: %w", aerr)
+				}
+				if a != nil {
+					atts = append(atts, *a)
+				}
 			case "tool_use":
 				fmt.Fprintf(&b, "ToolUse %s(%s)\n\n", bl.Name, string(bl.Input))
 			case "tool_result":
@@ -445,16 +586,158 @@ func renderPrompt(req *MessagesRequest) (string, error) {
 				}
 				fmt.Fprintf(&b, "%s: %s\n\n", label, inner)
 			default:
-				// images/redacted_thinking/etc — drop silently, upstream is text-only.
+				// thinking/redacted_thinking/etc — dropped silently.
 			}
 		}
 	}
 
 	out := strings.TrimSpace(b.String())
-	if out == "" {
-		return "", errors.New("messages rendered to empty text")
+	if out == "" && len(atts) == 0 {
+		return "", nil, errors.New("messages rendered to empty text")
 	}
-	return out, nil
+	return out, atts, nil
+}
+
+// attachmentFromImageBlock converts an Anthropic `image` content block
+// (base64 or URL source) into a chat.Attachment for the upstream upload
+// channel. URL sources are fetched here so the bytes ride the same
+// out-of-band path the app uses for pasted files.
+func attachmentFromImageBlock(bl *ContentBlock) (*chat.Attachment, error) {
+	if len(bl.Source) == 0 {
+		return nil, errors.New("missing source")
+	}
+	var src struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+		URL       string `json:"url"`
+	}
+	if err := json.Unmarshal(bl.Source, &src); err != nil {
+		return nil, fmt.Errorf("bad source: %w", err)
+	}
+	switch src.Type {
+	case "base64":
+		raw, err := base64.StdEncoding.DecodeString(src.Data)
+		if err != nil {
+			return nil, fmt.Errorf("bad base64: %w", err)
+		}
+		mime := src.MediaType
+		if mime == "" {
+			mime = "image/png"
+		}
+		return &chat.Attachment{
+			Name:     "image." + extForMime(mime),
+			MimeType: mime,
+			Data:     raw,
+		}, nil
+	case "url":
+		raw, mime, err := fetchURL(src.URL)
+		if err != nil {
+			return nil, err
+		}
+		if mime == "" {
+			mime = src.MediaType
+		}
+		if mime == "" {
+			mime = "image/png"
+		}
+		return &chat.Attachment{
+			Name:     "image." + extForMime(mime),
+			MimeType: mime,
+			Data:     raw,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported image source type %q", src.Type)
+	}
+}
+
+// attachmentFromDocumentBlock converts a `document` block (PDF/txt/etc,
+// base64 or URL) into a chat.Attachment.
+func attachmentFromDocumentBlock(bl *ContentBlock) (*chat.Attachment, error) {
+	if len(bl.Source) == 0 {
+		return nil, errors.New("missing source")
+	}
+	var src struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+		URL       string `json:"url"`
+	}
+	if err := json.Unmarshal(bl.Source, &src); err != nil {
+		return nil, fmt.Errorf("bad source: %w", err)
+	}
+	name := "document.bin"
+	mime := src.MediaType
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	if t := extForMime(mime); t != "bin" {
+		name = "document." + t
+	}
+	var raw []byte
+	switch src.Type {
+	case "base64":
+		b, err := base64.StdEncoding.DecodeString(src.Data)
+		if err != nil {
+			return nil, fmt.Errorf("bad base64: %w", err)
+		}
+		raw = b
+	case "url":
+		b, got, err := fetchURL(src.URL)
+		if err != nil {
+			return nil, err
+		}
+		raw = b
+		if got != "" {
+			mime = got
+		}
+	default:
+		return nil, fmt.Errorf("unsupported document source type %q", src.Type)
+	}
+	return &chat.Attachment{Name: name, MimeType: mime, Data: raw}, nil
+}
+
+// fetchURL downloads bytes from a URL with a 30s cap.
+func fetchURL(u string) (data []byte, mime string, err error) {
+	cli := &http.Client{Timeout: 30 * time.Second}
+	resp, err := cli.Get(u) //nolint:gosec // client-supplied URL is the point
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, "", fmt.Errorf("fetch %s: status %d", u, resp.StatusCode)
+	}
+	mime = resp.Header.Get("Content-Type")
+	if i := strings.IndexByte(mime, ';'); i >= 0 {
+		mime = strings.TrimSpace(mime[:i])
+	}
+	const maxBytes = 20 << 20
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(raw) > maxBytes {
+		return nil, "", fmt.Errorf("fetch %s: >%d bytes", u, maxBytes)
+	}
+	return raw, mime, nil
+}
+
+func extForMime(m string) string {
+	switch {
+	case strings.HasPrefix(m, "image/"):
+		return strings.TrimPrefix(m, "image/")
+	case m == "application/pdf":
+		return "pdf"
+	case strings.HasPrefix(m, "text/"):
+		return "txt"
+	case m == "application/json":
+		return "json"
+	case m == "application/octet-stream":
+		return "bin"
+	default:
+		return "bin"
+	}
 }
 
 // parseToolCalls detects a single tool_use JSON the model emitted as its

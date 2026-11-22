@@ -117,18 +117,28 @@ The knobs you're most likely to touch:
 
 ## Limitations (v1)
 
-- Text only — image/file parts are rejected with a 400.
-- Tools are advisory: `/v1/chat/completions` rejects client-side tools;
-  `/v1/messages` flattens tool declarations into the prompt and parses
-  tool_use JSON back out of the reply — there is no real tool runtime.
-- Each request is a fresh upstream session (fresh WebSocket, fresh
-  thread). Multi-turn works because the transcript is flattened into the
-  prompt; there is no server-side thread reuse yet.
+- ~~Text only — image/file parts are rejected with a 400.~~ Fixed in v1.1:
+  `image`/`document` blocks ride the upstream attachment channel
+  (upload-attachment → dlp-status → deliver → short `user_message` with
+  `attachments=[{path,attachmentId}]`), same path the app uses for pasted
+  files. `/v1/chat/completions` still rejects client-declared tools.
+- ~~Tools are advisory~~ Partial fix in v1.1: enable `tools:` in config
+  (`tools.bash.enabled` / `tools.files.enabled`) and `/v1/messages` runs a
+  real tool loop — the proxy executes `Bash`/`Read`/`Write`/`Edit`/
+  `Glob`/`Grep`/`LS`/`TodoWrite` locally and feeds `tool_result` back
+  until the model stops calling tools (`tools.max_tool_rounds` caps it).
+  `/v1/chat/completions` still rejects client-declared tools.
+- ~~Each request is a fresh upstream session~~ Fixed in v1.1: set
+  `X-Conversation-Id` / `X-Session-Id` on the request and the bridge
+  pools the upstream conversation by that id — multi-turn becomes a real
+  thread instead of a re-flattened prompt.
 - One upstream account = one outpost = one lane; `max_concurrency` bounds
-  pressure but upstream quota is shared with your app usage.
+  pressure but upstream quota is shared with your app usage. A
+  `quick.accounts` pool is planned (devin2api's account-pool pattern).
 - If the Quick desktop session itself dies (logged out / token revoked),
   the proxy has no fallback — the upstream answers 401 and turns fail
-  until you sign back in to the app.
+  until you sign back in to the app. `/healthz` now reports `degraded`
+  so an operator can see it.
 
 ## Project layout
 

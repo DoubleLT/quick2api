@@ -106,16 +106,25 @@ ssh -N -R 8377:127.0.0.1:8377 user@dev-host
 
 ## v1 限制
 
-- 仅文本——图片/文件 part 直接 400。
-- 工具是"协议面"而非运行时：`/v1/chat/completions` 拒绝客户端
-  tools；`/v1/messages` 把 tools 声明展平进 prompt、再把回复里的
-  tool_use JSON 解回 block——没有真正的工具运行时。
-- 每个请求都是新的上游会话（新 WebSocket、新 thread）：多轮对话靠把
-  历史拼进 prompt；还没有服务端 thread 复用。
+- ~~仅文本——图片/文件 part 直接 400。~~ v1.1 已修：`image`/`document`
+  块走上游附件通道（upload-attachment → dlp-status → deliver →
+  短 `user_message` 带 `attachments=[{path,attachmentId}]`），与应用
+  粘贴文件同一条路径。`/v1/chat/completions` 仍拒绝客户端声明的 tools。
+- ~~工具是"协议面"而非运行时~~ v1.1 部分解决：config 里开 `tools:`
+  （`tools.bash.enabled` / `tools.files.enabled`）后 `/v1/messages`
+  跑真正的 tool loop——代理本地执行 `Bash`/`Read`/`Write`/`Edit`/
+  `Glob`/`Grep`/`LS`/`TodoWrite` 并把 `tool_result` 喂回去直到模型停
+  手（`tools.max_tool_rounds` 限轮）。`/v1/chat/completions` 仍拒绝
+  客户端声明的 tools。
+- ~~每个请求都是新的上游会话~~ v1.1 已修：请求带 `X-Conversation-Id` /
+  `X-Session-Id` 头时 bridge 按该 id 复用上游会话——多轮变成真正的
+  thread 而不是每次把历史重拼进 prompt。
 - 一个上游账号 = 一个 outpost = 一条 lane；`max_concurrency` 只限本地
-  并发，上游配额与桌面应用共享。
+  并发，上游配额与桌面应用共享。`quick.accounts` 账号池在计划中
+  （照 devin2api 的账号池模式）。
 - Quick 桌面端会话本身失效（登出/凭据被吊销）时代理没有兜底——
-  上游回 401，直到你重新登录应用为止。
+  上游回 401，直到你重新登录应用为止。`/healthz` 现在会报 `degraded`
+  让运维能看见。
 
 ## 目录
 

@@ -13,6 +13,7 @@ import (
 	"github.com/kilbertert/quick2api/internal/bridge"
 	"github.com/kilbertert/quick2api/internal/config"
 	"github.com/kilbertert/quick2api/internal/debuglog"
+	"github.com/kilbertert/quick2api/internal/tools"
 )
 
 // App is the running server.
@@ -34,6 +35,18 @@ func New(cfg *config.Config, b *bridge.Bridge, dlog *debuglog.Logger) *App {
 	sem := make(chan struct{}, max)
 	h := &openai.Handler{Bridge: b, Cfg: cfg, Debug: dlog, Sem: sem}
 	ah := &anthropic.Handler{Bridge: b, Cfg: cfg, Debug: dlog, Sem: sem}
+	if cfg.Tools.Bash.Enabled || cfg.Tools.Files.Enabled {
+		// Server-side tool executor enabled: convert the advisory
+		// "answer with tool_use JSON" contract into a real loop.
+		var tcfg tools.Config
+		tcfg.Bash.Enabled = cfg.Tools.Bash.Enabled
+		tcfg.Bash.Allow = cfg.Tools.Bash.Allow
+		tcfg.Bash.Cwd = cfg.Tools.Bash.Cwd
+		tcfg.Bash.TimeoutS = cfg.Tools.Bash.TimeoutS
+		tcfg.Files.Enabled = cfg.Tools.Files.Enabled
+		tcfg.Files.Root = cfg.Tools.Files.Root
+		ah.Tools = tools.New(tcfg)
+	}
 	a := &App{Cfg: cfg, Bridge: b, Debug: dlog, Handler: h, Anthropic: ah, Mux: http.NewServeMux()}
 	a.routes()
 	return a

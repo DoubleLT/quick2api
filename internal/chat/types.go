@@ -55,17 +55,35 @@ type TurnEvent struct {
 	Err   error
 }
 
-// TurnOpts controls one RunTurn call.
+// TurnOpts controls one Send / RunTurn call.
 type TurnOpts struct {
-	Text           string
+	Text string
+	// ConversationID pins this turn to an upstream thread (the upstream
+	// conflates session_id==thread_id==conversationId). Empty starts a new
+	// one-shot conversation; a reused id continues that thread server-side.
+	ConversationID string
 	AgentMode      string
 	ThinkingEffort string
 	UserTimezone   string
 	UserLocale     string
 	Title          string
+	// Attachments are out-of-band references for multimodal input
+	// (image/file blocks). Each entry is {name,mime,type,data}; the send
+	// path uploads them via uploadAttachment and wires the returned
+	// server path into payload.attachments.
+	Attachments []Attachment
 	// OnEvent is invoked synchronously from the read loop; implementations
 	// should be fast or hand off to a channel.
 	OnEvent func(TurnEvent)
+}
+
+// Attachment is one multimodal input part to ship out-of-band.
+type Attachment struct {
+	Name     string // filename shown to the model
+	MimeType string // e.g. "image/png"
+	// Data is the raw bytes. Upload happens in sendPrompt — keep this under
+	// the ~20MB practical ceiling the attachment service accepts.
+	Data []byte
 }
 
 // Client wires the WebSocket connection.

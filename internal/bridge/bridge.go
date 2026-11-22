@@ -15,7 +15,8 @@ import (
 	"github.com/kilbertert/quick2api/internal/session"
 )
 
-// Bridge owns the upstream session source.
+// Bridge owns the upstream session source and a pool of persistent
+// upstream conversations keyed by client-provided ConversationID.
 type Bridge struct {
 	cfg *config.Config
 
@@ -24,12 +25,20 @@ type Bridge struct {
 	sess    *session.Session
 	sessAt  time.Time
 	sessErr error
+
+	// conns holds live upstream conversations (one AIDP socket each),
+	// keyed by client-provided ConversationID → its thread_id. A stale
+	// or dead socket is dropped on next use; entries age out via sweep.
+	conns map[string]*chat.Conn
+	// lastUpErr keeps the most recent upstream error for /healthz so the
+	// endpoint can report degraded state instead of a bare "ok".
+	lastUpErr error
 }
 
 // New prepares the session source. It eagerly verifies the source once so a
 // broken install fails at startup, not on the first request.
 func New(ctx context.Context, cfg *config.Config) (*Bridge, error) {
-	b := &Bridge{cfg: cfg}
+	b := &Bridge{cfg: cfg, conns: make(map[string]*chat.Conn)}
 	done := ctx.Done()
 	switch {
 	case cfg.Quick.SessionFile != "":
@@ -71,13 +80,17 @@ func New(ctx context.Context, cfg *config.Config) (*Bridge, error) {
 	return b, nil
 }
 
-// Close releases the spawned outpost (attached/file modes are no-ops).
+// Close releases the spawned outpost and every pooled conversation.
 func (b *Bridge) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.outpost != nil {
 		b.outpost.Close()
 		b.outpost = nil
+	}
+	for k, cn := range b.conns {
+		cn.Close()
+		delete(b.conns, k)
 	}
 }
 
@@ -126,13 +139,30 @@ func (b *Bridge) ChatClient() *chat.Client {
 	}
 }
 
-// RunTurn fetches a fresh-enough session then runs the turn. One retry on a
-// mid-handshake auth failure refreshes the session once.
+// RunTurn fetches a fresh-enough session then runs the turn.
+//
+// When opts.ConversationID is set the bridge first tries a live pooled
+// connection on that upstream thread; if none exists it dials a new
+// conversation and pools it for the next request on the same ID. A dead
+// socket is dropped and redialed once. One retry on a mid-handshake auth
+// failure refreshes the sncs-session and retries on a fresh conn.
 func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
 	sess, err := b.Session(false)
 	if err != nil {
+		b.noteErr(err)
 		return nil, err
 	}
+
+	// Session reuse: keep one live conversation per client ConversationID.
+	if opts.ConversationID != "" {
+		if res, err := b.sendOnPool(ctx, sess, opts); err == nil || !retryable(err) {
+			return res, err
+		}
+		// The pooled conn went stale or the send died mid-handshake —
+		// drop it and fall through to a fresh dial.
+		b.dropConn(opts.ConversationID)
+	}
+
 	res, err := b.ChatClient().RunTurn(ctx, sess, opts)
 	if err != nil {
 		var ue *chat.UpstreamError
@@ -142,9 +172,64 @@ func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnRes
 				return b.ChatClient().RunTurn(ctx, sess2, opts)
 			}
 		}
+		b.noteErr(err)
 		return nil, err
 	}
 	return res, nil
+}
+
+// retryable reports whether a Send failure is worth retrying on a fresh
+// connection — i.e. it died on the wire, not inside the model.
+func retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *chat.UpstreamError
+	return !errors.As(err, &ue)
+}
+
+// sendOnPool sends on the pooled conversation for opts.ConversationID,
+// creating it if missing. Returns (nil, err) when the pooled path can't
+// serve this turn so the caller can fall back to a one-shot.
+func (b *Bridge) sendOnPool(ctx context.Context, sess *session.Session, opts chat.TurnOpts) (*chat.TurnResult, error) {
+	b.mu.Lock()
+	cn := b.conns[opts.ConversationID]
+	if cn != nil && !cn.Alive() {
+		delete(b.conns, opts.ConversationID)
+		cn = nil
+	}
+	b.mu.Unlock()
+
+	if cn == nil {
+		var err error
+		cn, err = b.ChatClient().NewConversation(ctx, sess, opts.ConversationID)
+		if err != nil {
+			b.noteErr(err)
+			return nil, err
+		}
+		b.mu.Lock()
+		b.conns[opts.ConversationID] = cn
+		b.mu.Unlock()
+		slog.Info("upstream conversation opened", "conversation", opts.ConversationID)
+	}
+	return cn.Send(ctx, sess, opts)
+}
+
+// dropConn removes and closes the pooled conn for an ID (stale / errored).
+func (b *Bridge) dropConn(id string) {
+	b.mu.Lock()
+	if cn := b.conns[id]; cn != nil {
+		cn.Close()
+		delete(b.conns, id)
+	}
+	b.mu.Unlock()
+}
+
+// noteErr records the latest upstream error for the health endpoint.
+func (b *Bridge) noteErr(err error) {
+	b.mu.Lock()
+	b.lastUpErr = err
+	b.mu.Unlock()
 }
 
 // Info reports the current session source for /healthz (no secrets).
@@ -168,6 +253,13 @@ func (b *Bridge) Info() map[string]any {
 		out["provider"] = b.sess.Provider
 		out["account"] = b.sess.AWSAccountID
 		out["session_age_s"] = int(time.Since(b.sessAt).Seconds())
+	}
+	out["pooled_conversations"] = len(b.conns)
+	if b.lastUpErr != nil {
+		out["upstream_state"] = "degraded"
+		out["upstream_error"] = b.lastUpErr.Error()
+	} else {
+		out["upstream_state"] = "ok"
 	}
 	return out
 }

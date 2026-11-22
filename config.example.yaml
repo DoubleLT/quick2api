@@ -77,3 +77,24 @@ api:
   # 下游 /v1/* 的 Bearer 校验。空值=不校验——只在 listen 为回环时可接受。
   # 本机用给自己起一个长一点的随机串即可：
   # api_key: "q2a-local-<随机>"
+
+tools:
+  # 服务器端工具执行器。开了以后 /v1/messages 的 tool_use 不再是"建议模型
+  # 怎么答"，而是真的在这台机器上执行后再把 tool_result 喂回去——多轮
+  # tool-loop 由 proxy 自己跑，客户端照常收 end_turn。
+  #
+  # 打开 bash/files 任一项即激活执行器；都不开 = advisory 模式（schema
+  # 进 prompt、tool_use 原样返回）。
+  # bash:
+  #   enabled: true
+  #   # 允许的命令形态，glob/前缀匹配；空列表=不限制（慎用）。
+  #   allow: ["git *", "ls *", "cat *", "go build *", "go test *"]
+  #   cwd: "/home/claude/Playground"       # 空值用 files.root 或进程 cwd
+  #   timeout_seconds: 60
+  # files:
+  #   enabled: true
+  #   # 所有 Read/Write/Edit/Glob/Grep/LS 的路径都被关在这个根目录里，
+  #   # 模型写不出这个圈。空值 = 当前工作目录。
+  #   root: "/home/claude/Playground"
+  # tool_use → tool_result → 再发一轮 的循环上限，防模型连环调。默认 4。
+  # max_tool_rounds: 8

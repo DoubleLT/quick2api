@@ -7,9 +7,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/kilbertert/quick2api/internal/session"
 )
+
+// attachmentKind picks the wire `type` the renderer puts on an attachment.
+func attachmentKind(mime string) string {
+	if strings.HasPrefix(mime, "image/") {
+		return "image"
+	}
+	return "file"
+}
 
 // maxSingleText is the largest user_message text the AIDP upstream accepts
 // before it closes the turn with an empty {"type":"error"} frame. Verified
@@ -23,33 +32,60 @@ const maxSingleText = 55_000
 // user_message turns with context-priming prefixes.
 func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string, opts TurnOpts, sess *session.Session) (*TurnResult, error) {
 
+	// 1. Upload any caller-provided attachments (multimodal input). Image
+	// and file parts ride the out-of-band upload-attachment channel — the
+	// wire `type` is "image" or "file" and the referenced `path` is the
+	// server path returned by the deliver call.
+	var wireAtts []map[string]any
+	canUpload := sess != nil && sess.TenantURL != "" && sess.IDToken != ""
+	if canUpload {
+		for _, att := range opts.Attachments {
+			mime := att.MimeType
+			if mime == "" {
+				mime = "application/octet-stream"
+			}
+			path, attID, err := uploadAttachment(ctx, sess, conversationID, att.Name, att.Data)
+			slog.Debug("attachment upload", "name", att.Name, "path", path, "attID", attID, "err", err)
+			if err != nil || path == "" {
+				slog.Warn("attachment upload failed; dropping part", "name", att.Name, "err", err)
+				continue
+			}
+			wireAtts = append(wireAtts, map[string]any{
+				"type":         attachmentKind(mime),
+				"name":         att.Name,
+				"size":         len(att.Data),
+				"mimeType":     mime,
+				"path":         path,
+				"attachmentId": attID,
+			})
+		}
+	}
+
+	// 2. Small text (+ any uploaded attachments) → single user_message.
 	if len(opts.Text) <= maxSingleText {
-		if err := sendUserMessage(t, conversationID, opts.Text, opts, nil); err != nil {
+		if err := sendUserMessage(t, conversationID, opts.Text, opts, wireAtts); err != nil {
 			return nil, err
 		}
 		return t.collect(ctx, &TurnResult{FinishReason: "stop"})
 	}
 
-	// Out-of-band attachment: upload the prompt as a text file via the
-	// tenant's /integration/quick-work/* attachment APIs, then send a
-	// short user_message that references the returned server path. The
-	// model reads the file server-side; the text stays under the frame
-	// limit. File-loaded sessions have no tenant binding → attachments
-	// unavailable → straight to chunk fallback.
+	// 3. Oversized text — try the out-of-band path first (one model turn
+	// instead of N); fall back to sequential primed chunks when the upload
+	// channel can't deliver.
 	if sess != nil && sess.TenantURL != "" && sess.IDToken != "" {
 		path, attID, err := uploadAttachment(ctx, sess, conversationID, "prompt.txt", []byte(opts.Text))
 		slog.Debug("sendPrompt upload attempt", "path", path, "attID", attID, "err", err)
 		if err == nil && path != "" {
-			attachments := []map[string]any{{
+			wireAtts = append(wireAtts, map[string]any{
 				"type":         "file",
 				"name":         "prompt.txt",
 				"size":         len(opts.Text),
 				"mimeType":     "text/plain",
 				"path":         path,
 				"attachmentId": attID,
-			}}
+			})
 			short := "The full prompt is in the attached file prompt.txt. Read it and respond to it."
-			if err := sendUserMessage(t, conversationID, short, opts, attachments); err != nil {
+			if err := sendUserMessage(t, conversationID, short, opts, wireAtts); err != nil {
 				return nil, err
 			}
 			res, err := t.collect(ctx, &TurnResult{FinishReason: "stop"})

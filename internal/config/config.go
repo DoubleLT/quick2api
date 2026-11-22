@@ -21,6 +21,29 @@ type Config struct {
 	Debug  DebugConfig  `yaml:"debug"`
 	Quick  QuickConfig  `yaml:"quick"`
 	API    APIConfig    `yaml:"api"`
+	Tools  ToolsConfig  `yaml:"tools"`
+}
+
+// ToolsConfig describes the server-side tool executor. When the upstream
+// reply contains a tool_use block whose name is enabled here, the proxy
+// executes the tool and feeds the result back into the next turn so the
+// client sees real effects (the Assistants-API pattern).
+type ToolsConfig struct {
+	// Bash controls shell-command tools ("Bash", "sh", "shell").
+	Bash struct {
+		Enabled  bool     `yaml:"enabled"`
+		Allow    []string `yaml:"allow"` // glob/prefix patterns; empty = allow all
+		Cwd      string   `yaml:"cwd"`   // working dir; empty = files.root
+		TimeoutS int      `yaml:"timeout_seconds"`
+	} `yaml:"bash"`
+	// Files controls Read/Write/Edit/Glob/Grep/LS/TodoWrite. Root confines
+	// every path the model can touch.
+	Files struct {
+		Enabled bool   `yaml:"enabled"`
+		Root    string `yaml:"root"`
+	} `yaml:"files"`
+	// MaxToolRounds caps the tool_call→tool_result loop per request.
+	MaxToolRounds int `yaml:"max_tool_rounds"`
 }
 
 // ServerConfig controls the HTTP listener and request ceiling.
