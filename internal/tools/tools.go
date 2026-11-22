@@ -36,10 +36,10 @@ type Registry struct {
 type Config struct {
 	// Bash controls shell-command tools ("Bash", "sh", "shell").
 	Bash struct {
-		Enabled bool     `yaml:"enabled"`
-		Allow   []string `yaml:"allow"` // glob patterns; "*" allows everything
-		Cwd     string   `yaml:"cwd"`   // working dir; empty = process cwd
-		TimeoutS int    `yaml:"timeout_seconds"`
+		Enabled  bool     `yaml:"enabled"`
+		Allow    []string `yaml:"allow"` // glob patterns; "*" allows everything
+		Cwd      string   `yaml:"cwd"`   // working dir; empty = process cwd
+		TimeoutS int      `yaml:"timeout_seconds"`
 	} `yaml:"bash"`
 	// Files controls the file tools ("Read", "Write", "Edit", "Glob",
 	// "Grep", "LS", "MultiEdit", "TodoWrite"). Root confines all paths.
@@ -101,14 +101,16 @@ func (r *Registry) Exec(ctx context.Context, name string, input json.RawMessage)
 	}
 }
 
-func isBash(n string) bool   { return n == "Bash" || n == "bash" || n == "sh" || n == "shell" }
-func isTodo(n string) bool   { return n == "TodoWrite" || n == "todowrite" }
-func isLS(n string) bool     { return n == "LS" || n == "ls" }
-func isGlob(n string) bool   { return n == "Glob" || n == "glob" }
-func isGrep(n string) bool   { return n == "Grep" || n == "grep" }
-func isRead(n string) bool   { return n == "Read" || n == "read" }
-func isWrite(n string) bool  { return n == "Write" || n == "write" }
-func isEdit(n string) bool   { return n == "Edit" || n == "edit" || n == "MultiEdit" || n == "multiedit" || n == "NotebookEdit" }
+func isBash(n string) bool  { return n == "Bash" || n == "bash" || n == "sh" || n == "shell" }
+func isTodo(n string) bool  { return n == "TodoWrite" || n == "todowrite" }
+func isLS(n string) bool    { return n == "LS" || n == "ls" }
+func isGlob(n string) bool  { return n == "Glob" || n == "glob" }
+func isGrep(n string) bool  { return n == "Grep" || n == "grep" }
+func isRead(n string) bool  { return n == "Read" || n == "read" }
+func isWrite(n string) bool { return n == "Write" || n == "write" }
+func isEdit(n string) bool {
+	return n == "Edit" || n == "edit" || n == "MultiEdit" || n == "multiedit" || n == "NotebookEdit"
+}
 
 // ---- bash ----------------------------------------------------------------
 

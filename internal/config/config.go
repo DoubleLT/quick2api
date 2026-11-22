@@ -44,6 +44,14 @@ type ToolsConfig struct {
 	} `yaml:"files"`
 	// MaxToolRounds caps the tool_call→tool_result loop per request.
 	MaxToolRounds int `yaml:"max_tool_rounds"`
+	// Mode picks how tool calls are served:
+	//   "auto"        (default) — client-declared tools are passed through;
+	//                 the executor only serves its own tool names.
+	//   "passthrough" — every tool_use answer is returned to the client
+	//                 unexecuted; the executor is bypassed entirely.
+	//   "server"      — the executor always intercepts, even when the
+	//                 client declared its own tools (server wins).
+	Mode string `yaml:"mode"`
 }
 
 // ServerConfig controls the HTTP listener and request ceiling.
@@ -117,9 +125,19 @@ type QuickConfig struct {
 	// rotate round-robin; a lane that answers 401/403/5xx cools down for
 	// cooldown_seconds before serving again. One account = the current
 	// single-lane behavior.
-	Accounts           []AccountConfig `yaml:"accounts"`
-	CooldownSecs       int             `yaml:"cooldown_seconds"`
-	SessionAffinityTTL int             `yaml:"session_affinity_ttl_seconds"`
+	Accounts     []AccountConfig `yaml:"accounts"`
+	CooldownSecs int             `yaml:"cooldown_seconds"`
+	// HealthProbeSecs is how often each lane's session source is probed
+	// (sncs-session re-fetch). 0 = probe on failure only.
+	HealthProbeSecs int `yaml:"health_probe_seconds"`
+	// SessionAffinityTTL is kept for forward compatibility; lane affinity
+	// follows the pooled connection itself, so no separate TTL is needed.
+	SessionAffinityTTL int `yaml:"session_affinity_ttl_seconds"`
+	// Conn pool housekeeping: pooled upstream conversations are swept when
+	// idle longer than ConnIdleTTLSeconds or when the pool grows past
+	// MaxPooledConns (oldest-evicted).
+	ConnIdleTTLSeconds int `yaml:"conn_idle_ttl_seconds"`
+	MaxPooledConns     int `yaml:"max_pooled_conns"`
 }
 
 // AccountConfig is one lane of the upstream pool. Exactly one of the
@@ -127,7 +145,7 @@ type QuickConfig struct {
 //   - outpost_url + outpost_token   → attach to a running outpost
 //   - session_file                  → load a captured sncs-session JSON
 //   - (empty fields)                → spawn quickwork-agent locally with
-//                                    the top-level AgentPath/Manifest/etc.
+//     the top-level AgentPath/Manifest/etc.
 type AccountConfig struct {
 	Name         string `yaml:"name"` // shown in /healthz lanes[] and logs
 	OutpostURL   string `yaml:"outpost_url"`
@@ -158,9 +176,9 @@ func Defaults() *Config {
 			LogFrames:     false,
 		},
 		Quick: QuickConfig{
-			AgentPath:         "",
-			Manifest:          "desktop",
-			BuildStage:        "prod",
+			AgentPath:  "",
+			Manifest:   "desktop",
+			BuildStage: "prod",
 			// 0 = auto-pick a free loopback port. Hard-coding one would collide
 			// with whatever an earlier crashed run left listening.
 			OutpostPort:       0,
@@ -175,8 +193,11 @@ func Defaults() *Config {
 			AgentModes: map[string]string{
 				"quick": "smart",
 			},
-			Models:            nil,
-			SessionTTLSeconds: 600,
+			Models:             nil,
+			SessionTTLSeconds:  600,
+			HealthProbeSecs:    300,
+			ConnIdleTTLSeconds: 3600,
+			MaxPooledConns:     256,
 		},
 	}
 }
@@ -224,7 +245,46 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("quick.agent_modes[%q] is empty", k)
 		}
 	}
+	switch c.Tools.Mode {
+	case "", "auto", "passthrough", "server":
+	default:
+		return fmt.Errorf("tools.mode must be auto|passthrough|server, got %q", c.Tools.Mode)
+	}
+	for i, a := range c.Quick.Accounts {
+		switch {
+		case a.OutpostURL != "" && a.SessionFile != "":
+			return fmt.Errorf("quick.accounts[%d] (%q): set only one of outpost_url/session_file", i, a.Name)
+		case a.OutpostURL != "" && a.OutpostToken == "":
+			return fmt.Errorf("quick.accounts[%d] (%q): outpost_url requires outpost_token", i, a.Name)
+		}
+	}
 	return nil
+}
+
+// ConnIdleTTL bounds how long a pooled upstream conversation may sit
+// unused before the sweeper closes it.
+func (c *Config) ConnIdleTTL() time.Duration {
+	if c.Quick.ConnIdleTTLSeconds <= 0 {
+		return time.Hour
+	}
+	return time.Duration(c.Quick.ConnIdleTTLSeconds) * time.Second
+}
+
+// MaxPooledConns caps the number of pooled upstream conversations
+// (oldest-evicted when over).
+func (c *Config) MaxPooledConns() int {
+	if c.Quick.MaxPooledConns <= 0 {
+		return 256
+	}
+	return c.Quick.MaxPooledConns
+}
+
+// HealthProbeEvery is the lane session-probe cadence; 0 disables probing.
+func (c *Config) HealthProbeEvery() time.Duration {
+	if c.Quick.HealthProbeSecs <= 0 {
+		return 0
+	}
+	return time.Duration(c.Quick.HealthProbeSecs) * time.Second
 }
 
 // AgentModeFor maps a client model name to an upstream agent_mode.

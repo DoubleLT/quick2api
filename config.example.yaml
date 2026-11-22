@@ -89,7 +89,16 @@ quick:
   #     outpost_url: "http://127.0.0.1:8781"
   #     outpost_token: "another-64-hex"
   # cooldown_seconds: 60           # 每个 lane 可覆盖此默认值
-  # session_affinity_ttl_seconds: 0   # 预留——暂未实现，同 id 黏住 lane
+  #
+  # 会话亲和：客户端给的 conversation_id / X-Conversation-Id / X-Session-Id
+  # 命中某条已 alive 的 pooled WS 时，本请求直接钉在那条 lane 上——
+  # 不需要 TTL 表。conn 池本身由下面两管：
+  # conn_idle_ttl_seconds: 3600     # 超期未用的 pooled conn 关掉
+  # max_pooled_conns: 256           # 池上限，LRU 淘汰最旧
+  #
+  # 每条 lane 后台周期重取 session 探活：401/403 提前冷却该 lane，
+  # 健康时清掉 cooldown 恢复。0 = 关探针（单 lane 默认 300s）。
+  # health_probe_seconds: 300
 
 api:
   # 下游 /v1/* 的 Bearer 校验。空值=不校验——只在 listen 为回环时可接受。
@@ -103,6 +112,13 @@ tools:
   #
   # 打开 bash/files 任一项即激活执行器；都不开 = advisory 模式（schema
   # 进 prompt、tool_use 原样返回）。
+  #
+  # mode 决定"客户端声明 tools"跟"服务器 executor"谁赢：
+  #   auto        （默认）客户端声明了 tools → passthrough（你跑工具）；
+  #               没声明 → server（proxy 跑）
+  #   passthrough 永远把 tool_use 原样回给客户端（executor 空转）
+  #   server      永远 server-side 执行；客户端声明的 tools 仅作 schema 提示
+  # mode: auto
   # bash:
   #   enabled: true
   #   # 允许的命令形态，glob/前缀匹配；空列表=不限制（慎用）。

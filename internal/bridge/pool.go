@@ -102,6 +102,18 @@ func laneCooldown(a config.AccountConfig, cfg *config.Config) time.Duration {
 	return 60 * time.Second
 }
 
+// ownerOf returns the lane whose bridge still holds a live conn for id,
+// or nil. Affinity is "the socket lives where it was opened" — no TTL
+// map needed; once the conn dies the next request re-picks.
+func (p *Pool) ownerOf(id string) *Lane {
+	for _, l := range p.lanes {
+		if l.Bridge != nil && l.Bridge.Owns(id) {
+			return l
+		}
+	}
+	return nil
+}
+
 // pick selects the next live lane round-robin, skipping cooled ones.
 // Returns the lane plus its 1-based index for logging; nil when every
 // lane is cooled (caller then waits or reports 503).
@@ -124,11 +136,17 @@ func (l *Lane) cool(err error) {
 	slog.Warn("lane cooled", "lane", l.name, "err", err, "for", l.cooldownT)
 }
 
-// RunTurn picks a live lane and runs the turn; cooled lanes are skipped.
-// Auth-type failures cool the lane immediately so the next request tries
-// a different lane instead of hammering the dead one.
+// RunTurn picks the lane holding a live conn for opts.ConversationID when
+// one exists (affinity follows the socket, not a TTL map); otherwise it
+// rotates live lanes. Auth-type failures cool the lane and retry once on
+// another lane.
 func (p *Pool) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
-	l, idx := p.pick()
+	if opts.ConversationID != "" {
+		if l := p.ownerOf(opts.ConversationID); l != nil {
+			return l.Bridge.RunTurn(ctx, opts)
+		}
+	}
+	l, _ := p.pick()
 	if l == nil {
 		var last any
 		for _, ln := range p.lanes {
@@ -148,8 +166,57 @@ func (p *Pool) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResul
 			return l2.Bridge.RunTurn(ctx, opts)
 		}
 	}
-	_ = idx
 	return res, err
+}
+
+// Start launches the lane health probe: every cfg.HealthProbeEvery() it
+// re-fetches each lane's session, which forces a token mint — a lane
+// whose credentials died cools itself before the next request lands.
+// No-op when probing is disabled.
+func (p *Pool) Start(ctx context.Context) {
+	every := p.probeEvery()
+	if every <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				p.probeAll()
+			}
+		}
+	}()
+}
+
+func (p *Pool) probeEvery() time.Duration {
+	for _, l := range p.lanes {
+		if l.Bridge != nil && l.Bridge.cfg != nil {
+			return l.Bridge.cfg.HealthProbeEvery()
+		}
+	}
+	return 0
+}
+
+// probeAll re-fetches each lane's session once. A lane that errors is
+// marked cooled (its lastErr is visible on /healthz); a lane that
+// succeeds clears its cooldown.
+func (p *Pool) probeAll() {
+	for _, l := range p.lanes {
+		if l.Bridge == nil {
+			continue
+		}
+		if _, err := l.Bridge.Session(true); err != nil {
+			slog.Warn("lane health probe failed", "lane", l.name, "err", err)
+			l.cool(err)
+		} else if l.until.Load() != 0 {
+			slog.Info("lane recovered", "lane", l.name)
+			l.until.Store(0)
+		}
+	}
 }
 
 // coolable reports whether an error justifies cooling the lane: auth

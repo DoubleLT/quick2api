@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -103,6 +104,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer b.Close()
+	b.Start(ctx) // lane health probe
 
 	if *probe {
 		if err := runProbe(ctx, cfg, b, *probeText); err != nil {
@@ -117,6 +119,10 @@ func main() {
 		Addr:              cfg.Server.Listen,
 		Handler:           a.Mux,
 		ReadHeaderTimeout: 15 * time.Second,
+		// BaseContext ties every request to the signal context: on SIGTERM
+		// in-flight turns see ctx.Done() instead of just waiting for the
+		// shutdown timeout to elapse.
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	go func() {
 		<-ctx.Done()

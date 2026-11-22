@@ -27,19 +27,31 @@ type Bridge struct {
 	sessErr error
 
 	// conns holds live upstream conversations (one AIDP socket each),
-	// keyed by client-provided ConversationID → its thread_id. A stale
-	// or dead socket is dropped on next use; entries age out via sweep.
-	conns map[string]*chat.Conn
+	// keyed by client-provided ConversationID → its thread_id. Entries are
+	// swept by a ticker: idle past cfg.ConnIdleTTL() they are closed, and
+	// past cfg.MaxPooledConns() the oldest is evicted — both bounds keep a
+	// long-running process from accumulating dead sockets.
+	conns map[string]*connEntry
 	// lastUpErr keeps the most recent upstream error for /healthz so the
 	// endpoint can report degraded state instead of a bare "ok".
 	lastUpErr error
+
+	stopSweep chan struct{}
+}
+
+// connEntry tracks a pooled connection's last-use time for the sweeper.
+type connEntry struct {
+	conn   *chat.Conn
+	lastAt time.Time
 }
 
 // New prepares the session source. It eagerly verifies the source once so a
-// broken install fails at startup, not on the first request.
+// broken install fails at startup, not on the first request. The conn pool
+// sweeper starts here; ctx cancels it alongside the spawned outpost.
 func New(ctx context.Context, cfg *config.Config) (*Bridge, error) {
-	b := &Bridge{cfg: cfg, conns: make(map[string]*chat.Conn)}
+	b := &Bridge{cfg: cfg, conns: make(map[string]*connEntry), stopSweep: make(chan struct{})}
 	done := ctx.Done()
+	go b.sweepLoop(done)
 	switch {
 	case cfg.Quick.SessionFile != "":
 		s, err := session.LoadFile(cfg.Quick.SessionFile)
@@ -80,17 +92,68 @@ func New(ctx context.Context, cfg *config.Config) (*Bridge, error) {
 	return b, nil
 }
 
-// Close releases the spawned outpost and every pooled conversation.
+// Close releases the spawned outpost, every pooled conversation, and the
+// sweeper goroutine.
 func (b *Bridge) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	select {
+	case <-b.stopSweep:
+	default:
+		close(b.stopSweep)
+	}
 	if b.outpost != nil {
 		b.outpost.Close()
 		b.outpost = nil
 	}
-	for k, cn := range b.conns {
-		cn.Close()
+	for k, e := range b.conns {
+		e.conn.Close()
 		delete(b.conns, k)
+	}
+}
+
+// sweepLoop drops pooled conversations idle longer than ConnIdleTTL and
+// evicts the oldest when the pool exceeds MaxPooledConns.
+func (b *Bridge) sweepLoop(done <-chan struct{}) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-b.stopSweep:
+			return
+		case <-t.C:
+			b.sweepOnce()
+		}
+	}
+}
+
+func (b *Bridge) sweepOnce() {
+	idle := b.cfg.ConnIdleTTL()
+	max := b.cfg.MaxPooledConns()
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Idle TTL first.
+	for k, e := range b.conns {
+		if now.Sub(e.lastAt) > idle {
+			e.conn.Close()
+			delete(b.conns, k)
+		}
+	}
+	// Capacity second: evict oldest entries until under the cap.
+	for len(b.conns) > max {
+		var oldestKey string
+		var oldest time.Time
+		for k, e := range b.conns {
+			if oldestKey == "" || e.lastAt.Before(oldest) {
+				oldestKey, oldest = k, e.lastAt
+			}
+		}
+		e := b.conns[oldestKey]
+		e.conn.Close()
+		delete(b.conns, oldestKey)
 	}
 }
 
@@ -193,33 +256,47 @@ func retryable(err error) bool {
 // serve this turn so the caller can fall back to a one-shot.
 func (b *Bridge) sendOnPool(ctx context.Context, sess *session.Session, opts chat.TurnOpts) (*chat.TurnResult, error) {
 	b.mu.Lock()
-	cn := b.conns[opts.ConversationID]
-	if cn != nil && !cn.Alive() {
+	e := b.conns[opts.ConversationID]
+	if e != nil && !e.conn.Alive() {
 		delete(b.conns, opts.ConversationID)
-		cn = nil
+		e = nil
 	}
 	b.mu.Unlock()
 
-	if cn == nil {
+	if e == nil {
 		var err error
-		cn, err = b.ChatClient().NewConversation(ctx, sess, opts.ConversationID)
+		cn, err := b.ChatClient().NewConversation(ctx, sess, opts.ConversationID)
 		if err != nil {
 			b.noteErr(err)
 			return nil, err
 		}
+		e = &connEntry{conn: cn, lastAt: time.Now()}
 		b.mu.Lock()
-		b.conns[opts.ConversationID] = cn
+		b.conns[opts.ConversationID] = e
 		b.mu.Unlock()
 		slog.Info("upstream conversation opened", "conversation", opts.ConversationID)
 	}
-	return cn.Send(ctx, sess, opts)
+	res, err := e.conn.Send(ctx, sess, opts)
+	b.mu.Lock()
+	e.lastAt = time.Now()
+	b.mu.Unlock()
+	return res, err
+}
+
+// Owns reports whether this bridge holds a live pooled connection for
+// the given client ConversationID — used by Pool for lane affinity.
+func (b *Bridge) Owns(id string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e := b.conns[id]
+	return e != nil && e.conn.Alive()
 }
 
 // dropConn removes and closes the pooled conn for an ID (stale / errored).
 func (b *Bridge) dropConn(id string) {
 	b.mu.Lock()
-	if cn := b.conns[id]; cn != nil {
-		cn.Close()
+	if e := b.conns[id]; e != nil {
+		e.conn.Close()
 		delete(b.conns, id)
 	}
 	b.mu.Unlock()

@@ -31,26 +31,27 @@ type Handler struct {
 	Cfg    *config.Config
 	Debug  *debuglog.Logger
 	Sem    chan struct{} // concurrency ceiling
-	// Tools is the server-side executor; nil = advisory mode.
-	Tools tools.Executor
+	// Tools is the server-side executor registry; nil = advisory mode.
+	// *Registry so execFor can ask Has() for auto-mode passthrough.
+	Tools *tools.Registry
 }
 
 // ---------- request/response types (subset of the OpenAI schema) ----------
 
 type ChatRequest struct {
-	Model            string          `json:"model"`
-	Messages         []Message       `json:"messages"`
-	Stream           bool            `json:"stream"`
-	StreamOptions    *StreamOptions  `json:"stream_options"`
-	MaxTokens        int             `json:"max_tokens"`
-	Temperature      *float64        `json:"temperature"`
-	ReasoningEffort  string          `json:"reasoning_effort"`
-	Metadata         json.RawMessage `json:"metadata"`
-	ResponseFormat   json.RawMessage `json:"response_format"`
-	Tools            json.RawMessage `json:"tools"`
-	ToolChoice       json.RawMessage `json:"tool_choice"`
-	Stop             json.RawMessage `json:"stop"`
-	N                int             `json:"n"`
+	Model           string          `json:"model"`
+	Messages        []Message       `json:"messages"`
+	Stream          bool            `json:"stream"`
+	StreamOptions   *StreamOptions  `json:"stream_options"`
+	MaxTokens       int             `json:"max_tokens"`
+	Temperature     *float64        `json:"temperature"`
+	ReasoningEffort string          `json:"reasoning_effort"`
+	Metadata        json.RawMessage `json:"metadata"`
+	ResponseFormat  json.RawMessage `json:"response_format"`
+	Tools           json.RawMessage `json:"tools"`
+	ToolChoice      json.RawMessage `json:"tool_choice"`
+	Stop            json.RawMessage `json:"stop"`
+	N               int             `json:"n"`
 	// ConversationID pins the upstream thread (same contract as
 	// /v1/messages): when set the bridge pools one conversation per id.
 	ConversationID string `json:"conversation_id,omitempty"`
@@ -73,16 +74,16 @@ type Message struct {
 }
 
 type choice struct {
-	Index        int            `json:"index"`
-	Message      *MessageOut    `json:"message,omitempty"`
-	Delta        *MessageOut    `json:"delta,omitempty"`
-	FinishReason string         `json:"finish_reason,omitempty"`
+	Index        int         `json:"index"`
+	Message      *MessageOut `json:"message,omitempty"`
+	Delta        *MessageOut `json:"delta,omitempty"`
+	FinishReason string      `json:"finish_reason,omitempty"`
 }
 
 type MessageOut struct {
-	Role      string          `json:"role,omitempty"`
-	Content   string          `json:"content,omitempty"`
-	ToolCalls []ToolCall      `json:"tool_calls,omitempty"`
+	Role      string     `json:"role,omitempty"`
+	Content   string     `json:"content,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // ToolCall is OpenAI's function-call shape. We translate the model's
@@ -110,11 +111,11 @@ type usage struct {
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
 	// Quick-specific extensions (all optional).
-	CacheReadTokens   int64   `json:"cache_read_input_tokens,omitempty"`
-	CacheWriteTokens  int64   `json:"cache_write_input_tokens,omitempty"`
-	ResolvedModelID   string  `json:"quick_resolved_model_id,omitempty"`
-	CostUSD           float64 `json:"quick_cost_usd,omitempty"`
-	ContextWindow     int64   `json:"quick_context_window,omitempty"`
+	CacheReadTokens  int64   `json:"cache_read_input_tokens,omitempty"`
+	CacheWriteTokens int64   `json:"cache_write_input_tokens,omitempty"`
+	ResolvedModelID  string  `json:"quick_resolved_model_id,omitempty"`
+	CostUSD          float64 `json:"quick_cost_usd,omitempty"`
+	ContextWindow    int64   `json:"quick_context_window,omitempty"`
 }
 
 // ---------- endpoint ----------
@@ -191,23 +192,49 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.Cfg.TurnTimeout())
 	defer cancel()
 
+	clientTools := clientHasTools(req.Tools)
+	exec := h.execFor(clientTools)
 	if req.Stream {
 		h.stream(w, r, ctx, reqID, model, agentMode, thinking, text, atts,
-			conversationID, dlogDir)
+			conversationID, exec, clientTools, dlogDir)
 		return
 	}
 	h.complete(w, r, ctx, reqID, model, agentMode, thinking, text, atts,
-		conversationID, dlogDir)
+		conversationID, exec, dlogDir)
+}
+
+// clientHasTools mirrors the Anthropic handler's check: the OpenAI
+// `tools` array is json.RawMessage of a []Tool schema.
+func clientHasTools(raw json.RawMessage) bool {
+	return len(raw) > 0 && string(raw) != "null" && string(raw) != "[]"
+}
+
+// execFor reports whether the server-side executor may intercept
+// tool_use replies for this request. Same contract as Anthropic's:
+// "passthrough" never intercepts, "server" always does, "auto"
+// intercepts only when the client declared no tools of its own.
+func (h *Handler) execFor(clientTools bool) bool {
+	if h.Tools == nil {
+		return false
+	}
+	switch h.Cfg.Tools.Mode {
+	case "server":
+		return true
+	case "passthrough":
+		return false
+	default:
+		return !clientTools
+	}
 }
 
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.Context,
 	reqID, model, agentMode, thinking, text string,
-	atts []chat.Attachment, conversationID, dlogDir string) {
+	atts []chat.Attachment, conversationID string, exec bool, dlogDir string) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
-		conversationID, frames, nil)
+		conversationID, exec, frames, nil, nil)
 	frames.Write(h.Debug, dlogDir)
 	if err != nil {
 		h.finishDebug(dlogDir, nil, err)
@@ -245,14 +272,15 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.C
 // feed the result back until the model stops calling tools.
 func (h *Handler) runAgent(ctx context.Context,
 	reqID, agentMode, thinking, text string,
-	atts []chat.Attachment, conversationID string,
-	frames *common.Frames, onDelta func(string)) (*chat.TurnResult, error) {
+	atts []chat.Attachment, conversationID string, exec bool,
+	frames *common.Frames, onDelta func(string),
+	onToolRound func(round int, calls []common.ToolCallJSON)) (*chat.TurnResult, error) {
 
 	maxRounds := h.Cfg.Tools.MaxToolRounds
 	if maxRounds <= 0 {
 		maxRounds = 4
 	}
-	if h.Tools == nil {
+	if !exec {
 		maxRounds = 1
 	}
 
@@ -281,8 +309,11 @@ func (h *Handler) runAgent(ctx context.Context,
 		}
 
 		calls, _ := common.ParseToolCallsJSON(res.Text)
-		if len(calls) == 0 || h.Tools == nil {
+		if len(calls) == 0 || !exec {
 			return res, nil
+		}
+		if onToolRound != nil {
+			onToolRound(round, calls)
 		}
 
 		var next strings.Builder
@@ -335,10 +366,11 @@ func openAIToolCalls(calls []common.ToolCallJSON) []ToolCall {
 	return out
 }
 
-// stream handles the SSE path.
+// stream handles the SSE path. Each tool round emits a `quick2api_tool`
+// chunk-shaped event; the final round's text arrives as one delta.
 func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Context,
 	reqID, model, agentMode, thinking, text string,
-	atts []chat.Attachment, conversationID, dlogDir string) {
+	atts []chat.Attachment, conversationID string, exec, clientTools bool, dlogDir string) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -368,17 +400,37 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 		Choices: []choice{{Index: 0, Delta: &MessageOut{Role: "assistant"}}},
 	})
 
+	// Live deltas only when nothing intercepts the answer (no executor
+	// on this request and no client-declared tools that would still
+	// arrive as one tool_use block).
+	liveDeltas := !exec && !clientTools
+
 	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
-		conversationID, frames,
+		conversationID, exec, frames,
 		func(delta string) {
-			if h.Tools == nil {
+			if liveDeltas {
 				emit(completion{
 					ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
 					Created: time.Now().Unix(), Model: model,
 					Choices: []choice{{Index: 0, Delta: &MessageOut{Content: delta}}},
 				})
 			}
+		},
+		func(round int, calls []common.ToolCallJSON) {
+			names := make([]string, len(calls))
+			for i, c := range calls {
+				names[i] = c.Name
+			}
+			// Chunk-shaped progress event — clients that read deltas see
+			// the server is working without leaking the tool JSON.
+			emit(completion{
+				ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
+				Created: time.Now().Unix(), Model: model,
+				Choices: []choice{{Index: 0, Delta: &MessageOut{
+					Content: fmt.Sprintf("[tool round %d: %s]", round, strings.Join(names, ", ")),
+				}}},
+			})
 		})
 	frames.Write(h.Debug, dlogDir)
 	if err != nil {
@@ -394,13 +446,16 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	}
 	result := res
 
-	// Tool-loop mode ran ahead of SSE; emit the final text as one delta.
-	if h.Tools != nil {
-		emit(completion{
-			ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
-			Created: time.Now().Unix(), Model: model,
-			Choices: []choice{{Index: 0, Delta: &MessageOut{Content: result.Text}}},
-		})
+	// Buffered reply: emit the final text as one delta, unless it parses
+	// as tool calls (emitted below as a tool_calls delta).
+	if !liveDeltas {
+		if calls, ok := common.ParseToolCallsJSON(result.Text); !ok || len(calls) == 0 {
+			emit(completion{
+				ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
+				Created: time.Now().Unix(), Model: model,
+				Choices: []choice{{Index: 0, Delta: &MessageOut{Content: result.Text}}},
+			})
+		}
 	}
 
 	fin := completion{
@@ -423,7 +478,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 		ID: "chatcmpl-" + reqID, Object: "chat.completion",
 		Created: time.Now().Unix(), Model: util.Or(result.ResolvedModel, model),
 		Choices: []choice{{Index: 0, Message: messageOutFor(result.Text), FinishReason: fin.Choices[0].FinishReason}},
-		Usage: mapUsage(result.Usage),
+		Usage:   mapUsage(result.Usage),
 	}, nil)
 }
 
@@ -701,9 +756,9 @@ func mapUsage(u *chat.TurnUsage) *usage {
 		return nil
 	}
 	return &usage{
-		PromptTokens:    u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens,
+		PromptTokens:     u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens,
 		CompletionTokens: u.OutputTokens,
-		TotalTokens:     u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens,
+		TotalTokens:      u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens,
 		CacheReadTokens:  u.CacheReadTokens,
 		CacheWriteTokens: u.CacheWriteTokens,
 		ResolvedModelID:  u.ResolvedModelID,

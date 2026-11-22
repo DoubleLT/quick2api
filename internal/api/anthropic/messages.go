@@ -39,9 +39,11 @@ type Handler struct {
 	Cfg    *config.Config
 	Debug  *debuglog.Logger
 	Sem    chan struct{}
-	// Tools is the server-side executor; nil = advisory mode (schemas go
-	// in the prompt, tool_use blocks come back to the caller as-is).
-	Tools tools.Executor
+	// Tools is the server-side executor registry; nil = advisory mode
+	// (schemas go in the prompt, tool_use blocks come back as-is).
+	// *Registry over Executor so execFor can ask Has() for auto-mode
+	// passthrough of client-declared tools.
+	Tools *tools.Registry
 }
 
 // ---------- request/response types (subset of the Messages schema) ----------
@@ -188,11 +190,19 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.Cfg.TurnTimeout())
 	defer cancel()
 
+	clientTools := clientHasTools(req.Tools)
+	exec := h.execFor(clientTools)
 	if req.Stream {
-		h.stream(w, ctx, reqID, model, agentMode, thinking, text, atts, conversationID, dlogDir)
+		h.stream(w, ctx, reqID, model, agentMode, thinking, text, atts, conversationID, exec, clientTools, dlogDir)
 		return
 	}
-	h.complete(w, ctx, reqID, model, agentMode, thinking, text, atts, conversationID, dlogDir)
+	h.complete(w, ctx, reqID, model, agentMode, thinking, text, atts, conversationID, exec, dlogDir)
+}
+
+// clientHasTools reports whether the client declared its own tool
+// schemas — those belong to the client's runtime in auto mode.
+func clientHasTools(raw json.RawMessage) bool {
+	return len(raw) > 0 && string(raw) != "null" && string(raw) != "[]"
 }
 
 // conversationIDOf resolves the client-supplied conversation id. Sources,
@@ -226,11 +236,11 @@ func conversationIDOf(r *http.Request, req *MessagesRequest) string {
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 	reqID, model, agentMode, thinking, text string,
-	atts []chat.Attachment, conversationID, dlogDir string) {
+	atts []chat.Attachment, conversationID string, exec bool, dlogDir string) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
-		conversationID, frames, nil)
+		conversationID, exec, frames, nil, nil)
 	// Always write frames before returning — the error path is exactly
 	// where they are needed to see the upstream's real error payload.
 	frames.Write(h.Debug, dlogDir)
@@ -259,23 +269,49 @@ func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// execFor reports whether the server-side executor may intercept
+// tool_use replies for this request:
+//   - "passthrough" never intercepts — every tool_use goes back to the
+//     client as a proper tool_use block;
+//   - "server" always intercepts (executor wins even when the client
+//     declared its own tools — client gets the final text only);
+//   - "auto" (default) intercepts only when the client declared no
+//     tools — client-declared tools belong to the client's own runtime.
+func (h *Handler) execFor(clientTools bool) bool {
+	if h.Tools == nil {
+		return false
+	}
+	switch h.Cfg.Tools.Mode {
+	case "server":
+		return true
+	case "passthrough":
+		return false
+	default: // "auto" / empty
+		return !clientTools
+	}
+}
+
 // runAgent performs the tool-use loop: sends the prompt, executes any
-// tool_use blocks the model emits via h.Tools, and feeds the results back
-// until the model stops calling tools or MaxToolRounds hits. Returns the
-// final TurnResult — the last upstream turn's text — so the caller maps
-// it to Anthropic blocks exactly like a single-shot call.
+// tool_use blocks the model emits via h.Tools (only when exec is set —
+// see execFor), and feeds the results back until the model stops calling
+// tools or MaxToolRounds hits. Returns the final TurnResult — the last
+// upstream turn's text — so the caller maps it to Anthropic blocks
+// exactly like a single-shot call.
 //
-// When h.Tools is nil this is a one-shot RunTurn (advisory mode).
+// onToolRound, when set, is invoked after each round that parsed as
+// tool calls — streaming callers use it to emit progress events instead
+// of the raw tool JSON.
 func (h *Handler) runAgent(ctx context.Context,
 	reqID, agentMode, thinking, text string,
-	atts []chat.Attachment, conversationID string,
-	frames *common.Frames, onDelta func(string)) (*chat.TurnResult, error) {
+	atts []chat.Attachment, conversationID string, exec bool,
+	frames *common.Frames, onDelta func(string),
+	onToolRound func(round int, calls []common.ToolCallJSON)) (*chat.TurnResult, error) {
 
 	maxRounds := h.Cfg.Tools.MaxToolRounds
 	if maxRounds <= 0 {
 		maxRounds = 4
 	}
-	if h.Tools == nil {
+	if !exec {
 		maxRounds = 1
 	}
 
@@ -304,8 +340,11 @@ func (h *Handler) runAgent(ctx context.Context,
 		}
 
 		calls, _ := common.ParseToolCallsJSON(res.Text)
-		if len(calls) == 0 || h.Tools == nil {
+		if len(calls) == 0 || !exec {
 			return res, nil
+		}
+		if onToolRound != nil {
+			onToolRound(round, calls)
 		}
 
 		var next strings.Builder
@@ -331,12 +370,12 @@ func (h *Handler) runAgent(ctx context.Context,
 
 // stream emits Anthropic SSE: message_start → content_block_start →
 // content_block_delta(text) ×N → content_block_stop → message_delta →
-// message_stop. Tool-use blocks can't stream (the input arrives whole
-// inside the text); when the finished text parses as a tool call we
-// still emit it as a single content_block — legal per the spec.
+// message_stop. Tool-use rounds can't stream live (the JSON arrives
+// whole); each completed tool round emits a `quick2api_tool` progress
+// event, and the final non-tool round's text is emitted as one delta.
 func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	reqID, model, agentMode, thinking, text string,
-	atts []chat.Attachment, conversationID, dlogDir string) {
+	atts []chat.Attachment, conversationID string, exec, clientTools bool, dlogDir string) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -380,28 +419,45 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	}
 	start()
 
+	// Live deltas only when nothing will intercept the answer: no
+	// executor on this request and no client-declared tools whose
+	// passthrough would still arrive as a single tool_use block.
+	liveDeltas := !exec && !clientTools
+
 	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
-		conversationID, frames,
+		conversationID, exec, frames,
 		func(delta string) {
-			// Advisory mode only: stream text deltas as they arrive.
-			// When h.Tools is set the loop runs ahead of SSE so the
-			// client gets a single final delta at content_block_stop.
-			if h.Tools == nil {
+			if liveDeltas {
 				emit("content_block_delta", map[string]any{
 					"index": 0,
 					"delta": map[string]any{"type": "text_delta", "text": delta},
 				})
 			}
+		},
+		func(round int, calls []common.ToolCallJSON) {
+			// Progress event per tool round — keeps the stream alive and
+			// tells the client the server is working without leaking the
+			// raw tool JSON.
+			names := make([]string, len(calls))
+			for i, c := range calls {
+				names[i] = c.Name
+			}
+			emit("quick2api_tool", map[string]any{
+				"round": round, "calls": names,
+			})
 		})
 	frames.Write(h.Debug, dlogDir)
 
-	if err == nil && res != nil && h.Tools != nil {
-		// Tool-loop mode ran ahead of SSE; emit the final text as one delta.
-		emit("content_block_delta", map[string]any{
-			"index": 0,
-			"delta": map[string]any{"type": "text_delta", "text": res.Text},
-		})
+	if err == nil && res != nil && !liveDeltas {
+		// The final text was buffered — emit it now as one delta, unless
+		// it parses as tool calls (emitted as a tool_use block below).
+		if calls, _ := common.ParseToolCallsJSON(res.Text); len(calls) == 0 {
+			emit("content_block_delta", map[string]any{
+				"index": 0,
+				"delta": map[string]any{"type": "text_delta", "text": res.Text},
+			})
+		}
 	}
 
 	// close the text block even on error — clients expect a terminated stream
@@ -447,10 +503,10 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 			"stop_sequence": nil,
 		},
 		"usage": map[string]any{
-			"input_tokens":                 u.InputTokens,
-			"output_tokens":                u.OutputTokens,
-			"cache_read_input_tokens":      u.CacheReadInputTokens,
-			"cache_creation_input_tokens":  u.CacheCreationInputTokens,
+			"input_tokens":                u.InputTokens,
+			"output_tokens":               u.OutputTokens,
+			"cache_read_input_tokens":     u.CacheReadInputTokens,
+			"cache_creation_input_tokens": u.CacheCreationInputTokens,
 		},
 	})
 	emit("message_stop", map[string]any{})
@@ -785,5 +841,3 @@ func writeErr(w http.ResponseWriter, status int, typ, msg string) {
 		"error": map[string]any{"type": typ, "message": msg},
 	})
 }
-
-

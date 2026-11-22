@@ -71,10 +71,10 @@ func Acquire(ctx context.Context, sem chan struct{}) (release func(), ok bool) {
 type UpstreamKind int
 
 const (
-	KindUpstream       UpstreamKind = iota // generic upstream failure → 502
-	KindUnauthenticated                    // upstream says creds bad/expired → 401
-	KindRateLimited                        // upstream throttled → 429
-	KindTimeout                            // ctx deadline → 504
+	KindUpstream        UpstreamKind = iota // generic upstream failure → 502
+	KindUnauthenticated                     // upstream says creds bad/expired → 401
+	KindRateLimited                         // upstream throttled → 429
+	KindTimeout                             // ctx deadline → 504
 )
 
 // UpstreamError maps err to (httpStatus, kind, message). Message is the

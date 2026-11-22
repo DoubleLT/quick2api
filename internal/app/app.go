@@ -18,12 +18,12 @@ import (
 
 // App is the running server.
 type App struct {
-	Cfg      *config.Config
-	Bridge   *bridge.Pool
-	Debug    *debuglog.Logger
-	Handler  *openai.Handler
+	Cfg       *config.Config
+	Bridge    *bridge.Pool
+	Debug     *debuglog.Logger
+	Handler   *openai.Handler
 	Anthropic *anthropic.Handler
-	Mux      *http.ServeMux
+	Mux       *http.ServeMux
 }
 
 // New builds the app over an already-initialized bridge.
