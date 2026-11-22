@@ -88,6 +88,30 @@ type anthropicMessage struct {
 	Usage        anthropicUsage `json:"usage"`
 }
 
+// CountTokens handles POST /v1/messages/count_tokens.
+//
+// The upstream has no tokenize endpoint, so this returns a heuristic
+// estimate (rendered prompt bytes / 4) and never touches the bridge —
+// count_tokens must not spend a billable turn.
+func (h *Handler) CountTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "invalid_request_error", "use POST")
+		return
+	}
+	var req MessagesRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error())
+		return
+	}
+	text, err := renderPrompt(&req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": len(text) / 4})
+}
+
 // ---------- endpoint ----------
 
 // Messages handles POST /v1/messages.

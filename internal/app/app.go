@@ -42,7 +42,7 @@ func New(cfg *config.Config, b *bridge.Bridge, dlog *debuglog.Logger) *App {
 func (a *App) routes() {
 	a.Mux.HandleFunc("POST /v1/chat/completions", a.auth(a.Handler.ChatCompletions))
 	a.Mux.HandleFunc("POST /v1/messages", a.auth(a.Anthropic.Messages))
-	a.Mux.HandleFunc("POST /v1/messages/count_tokens", a.auth(a.Anthropic.Messages))
+	a.Mux.HandleFunc("POST /v1/messages/count_tokens", a.auth(a.Anthropic.CountTokens))
 	a.Mux.HandleFunc("GET /v1/models", a.auth(a.Handler.Models))
 	a.Mux.HandleFunc("GET /healthz", a.healthz)
 	a.Mux.HandleFunc("GET /{$}", a.index)
