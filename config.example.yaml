@@ -73,6 +73,24 @@ quick:
   # "direct" 强制直连。
   # proxy: ""
 
+  # 账号池（v1.1+）。默认只有一条 lane（上面顶层字段决定）。配了 accounts
+  # 后每个 entry 是一条独立 lane：
+  #   - outpost_url + outpost_token  → attach 一个跑着的 outpost
+  #   - session_file                 → 直接读 sncs-session JSON
+  #   - 全空                         → 用顶层 AgentPath/Manifest 本地 spawn
+  # lane 间 round-robin；某 lane 回 401/403/5xx 会进 cooldown_seconds 冷却。
+  # 注意：同机 spawn 的多个 lane 会共享同一份登录凭据——真正的多账号
+  # 要么给不同机器 outpost_url、要么给不同 session_file。
+  # accounts:
+  #   - name: primary
+  #     outpost_url: "http://127.0.0.1:8780"
+  #     outpost_token: "64-hex-token"
+  #   - name: secondary
+  #     outpost_url: "http://127.0.0.1:8781"
+  #     outpost_token: "another-64-hex"
+  # cooldown_seconds: 60           # 每个 lane 可覆盖此默认值
+  # session_affinity_ttl_seconds: 0   # 预留——暂未实现，同 id 黏住 lane
+
 api:
   # 下游 /v1/* 的 Bearer 校验。空值=不校验——只在 listen 为回环时可接受。
   # 本机用给自己起一个长一点的随机串即可：

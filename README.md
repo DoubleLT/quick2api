@@ -115,30 +115,39 @@ The knobs you're most likely to touch:
 - `quick.outpost_url`/`outpost_token` — attach to an outpost you already run.
 - `quick.proxy` — outbound WSS proxy (defaults to system `HTTPS_PROXY`).
 
-## Limitations (v1)
+## Limitations
 
-- ~~Text only — image/file parts are rejected with a 400.~~ Fixed in v1.1:
-  `image`/`document` blocks ride the upstream attachment channel
-  (upload-attachment → dlp-status → deliver → short `user_message` with
-  `attachments=[{path,attachmentId}]`), same path the app uses for pasted
-  files. `/v1/chat/completions` still rejects client-declared tools.
-- ~~Tools are advisory~~ Partial fix in v1.1: enable `tools:` in config
-  (`tools.bash.enabled` / `tools.files.enabled`) and `/v1/messages` runs a
-  real tool loop — the proxy executes `Bash`/`Read`/`Write`/`Edit`/
-  `Glob`/`Grep`/`LS`/`TodoWrite` locally and feeds `tool_result` back
-  until the model stops calling tools (`tools.max_tool_rounds` caps it).
-  `/v1/chat/completions` still rejects client-declared tools.
-- ~~Each request is a fresh upstream session~~ Fixed in v1.1: set
-  `X-Conversation-Id` / `X-Session-Id` on the request and the bridge
-  pools the upstream conversation by that id — multi-turn becomes a real
-  thread instead of a re-flattened prompt.
-- One upstream account = one outpost = one lane; `max_concurrency` bounds
-  pressure but upstream quota is shared with your app usage. A
-  `quick.accounts` pool is planned (devin2api's account-pool pattern).
-- If the Quick desktop session itself dies (logged out / token revoked),
-  the proxy has no fallback — the upstream answers 401 and turns fail
-  until you sign back in to the app. `/healthz` now reports `degraded`
-  so an operator can see it.
+- **Credentials live in the desktop install.** quick2api inherits the
+  account Quick is logged into — it cannot mint a session on its own.
+  Sign out / token revoked → the upstream answers 401 and `/healthz`
+  reports `degraded` until you sign back in to the app.
+- **Thread reuse is opt-in.** Without `X-Conversation-Id` /
+  `X-Session-Id` each request still opens a fresh upstream turn; send
+  one to pin the same thread across calls.
+- **Tool calls are server-side.** `tools:` in config runs a local
+  executor (`bash`/`files`) that answers `{type:"tool_use",...}` replies;
+  the upstream model never runs a tool itself. `tools.max_tool_rounds`
+  caps the loop.
+- **Multi-account needs distinct outposts.** `quick.accounts` rotates
+  round-robin between lanes, but real multi-account usage requires an
+  outpost per account (separate Quick installs or `outpost_url`
+  attachments). `max_concurrency` is per-process, so lanes still share
+  CPU/memory.
+- **Client-side tool declarations are advisory unless enabled.** With
+  `tools:` off the proxy only writes the schema into the prompt and
+  parses `{type:"tool_use",...}` back — no execution.
+
+## What's new in v1.1
+
+- `image_url`/`file`/`image`/`document` parts ride the same
+  out-of-band attachment channel the app uses for pasted files.
+- `X-Conversation-Id` / `X-Session-Id` pool one upstream thread per id;
+  multi-turn becomes real thread reuse instead of a flattened transcript.
+- `quick.accounts` turns the bridge into a lane pool (round-robin +
+  per-lane cooldown on auth/5xx).
+- Server-side tool loop when `tools.bash`/`tools.files` are enabled.
+- `/v1/chat/completions` now accepts `tools` (advisory or real, per
+  `tools:` config); `/v1/messages` always accepts them.
 
 ## Project layout
 

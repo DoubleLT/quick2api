@@ -104,27 +104,34 @@ ssh -N -R 8377:127.0.0.1:8377 user@dev-host
 - `quick.outpost_url`/`outpost_token` —— 挂到你已经跑着的 outpost 上。
 - `quick.proxy` —— 上行 WSS 代理（默认走系统 `HTTPS_PROXY`）。
 
-## v1 限制
+## 限制
 
-- ~~仅文本——图片/文件 part 直接 400。~~ v1.1 已修：`image`/`document`
-  块走上游附件通道（upload-attachment → dlp-status → deliver →
-  短 `user_message` 带 `attachments=[{path,attachmentId}]`），与应用
-  粘贴文件同一条路径。`/v1/chat/completions` 仍拒绝客户端声明的 tools。
-- ~~工具是"协议面"而非运行时~~ v1.1 部分解决：config 里开 `tools:`
-  （`tools.bash.enabled` / `tools.files.enabled`）后 `/v1/messages`
-  跑真正的 tool loop——代理本地执行 `Bash`/`Read`/`Write`/`Edit`/
-  `Glob`/`Grep`/`LS`/`TodoWrite` 并把 `tool_result` 喂回去直到模型停
-  手（`tools.max_tool_rounds` 限轮）。`/v1/chat/completions` 仍拒绝
-  客户端声明的 tools。
-- ~~每个请求都是新的上游会话~~ v1.1 已修：请求带 `X-Conversation-Id` /
-  `X-Session-Id` 头时 bridge 按该 id 复用上游会话——多轮变成真正的
-  thread 而不是每次把历史重拼进 prompt。
-- 一个上游账号 = 一个 outpost = 一条 lane；`max_concurrency` 只限本地
-  并发，上游配额与桌面应用共享。`quick.accounts` 账号池在计划中
-  （照 devin2api 的账号池模式）。
-- Quick 桌面端会话本身失效（登出/凭据被吊销）时代理没有兜底——
-  上游回 401，直到你重新登录应用为止。`/healthz` 现在会报 `degraded`
-  让运维能看见。
+- **凭据来自桌面端。** quick2api 继承 Quick 登录的账号——它自己无法
+  独立建会话。登出/吊销 → 上游回 401、`/healthz` 报 `degraded`，直到
+  应用里重登为止。
+- **会话复用是可选的。** 不带 `X-Conversation-Id`/`X-Session-Id` 时
+  每个请求仍开新的上游 turn；带上则按 id 复用同一 thread。
+- **工具在服务端跑。** config 里 `tools:` 开起来后由本地 executor
+  （`bash`/`files`）应答 `{type:"tool_use",...}`——上游模型本身不跑
+  工具。`tools.max_tool_rounds` 限轮。
+- **多账号要不同 outpost。** `quick.accounts` 在 lane 间轮询，但真
+  多账号得一个 lane 一个 outpost（分开的 Quick 安装或挂别的
+  `outpost_url`）。`max_concurrency` 是进程级，lane 间仍共享 CPU/内存。
+- **客户端 tools 声明默认是建议性。** 不开 `tools:` 时代理只是把
+  schema 写进 prompt，然后把 `{type:"tool_use",...}` 解析出来——不
+  执行。
+
+## v1.1 新加
+
+- `image_url`/`file`/`image`/`document` 块走附件通道（与应用粘贴
+  文件同一条）。
+- `X-Conversation-Id`/`X-Session-Id` 按 id 复用上游 thread——多轮
+  是真 thread 而不是每次重拼历史。
+- `quick.accounts` 把 bridge 变成 lane 池（轮询 + auth/5xx 时每
+  lane 冷却）。
+- `tools.bash`/`tools.files` 开起来后跑服务端工具循环。
+- `/v1/chat/completions` 现在接受 `tools`（按 `tools:` 配置决定是否
+  执行）；`/v1/messages` 一直接受。
 
 ## 目录
 
