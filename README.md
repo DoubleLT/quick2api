@@ -118,6 +118,10 @@ internal/debuglog/  per-request debug directories
 docs/protocol.md    the wire facts (worth reading)
 ```
 
+## Powered by
+
+**[LINUX DO](https://linux.do/)** — 新的理想型社区 · The new ideal community
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

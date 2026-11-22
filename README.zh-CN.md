@@ -108,6 +108,10 @@ internal/debuglog/  按请求一个目录的调试记录
 docs/protocol.md    线上验证过的协议实录（值得一读）
 ```
 
+## Powered by
+
+**[LINUX DO](https://linux.do/)** —— 新的理想型社区
+
 ## 许可证
 
 MIT —— 见 [LICENSE](LICENSE)。
