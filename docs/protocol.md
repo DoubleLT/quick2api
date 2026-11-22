@@ -141,6 +141,30 @@ just pass through and ignore them), `error` `{code,message}`,
 `guardrail_blocked`, `session_end`, `session_title_updated`, various
 `*_sync` housekeeping frames.
 
+### Per-message text limit (~64–80 KB)
+
+A single `user_message.payload.text` over roughly **64–80 KB** makes the
+upstream close the turn with an empty `{"type":"error","payload":null}`
+frame — no code, no message. Verified 2026-11-22: 64 000 bytes goes
+through, 80 000 does not; the exact cutoff sits somewhere in between and
+probably depends on framing overhead.
+
+quick2api works around this by splitting the rendered prompt into
+≤ 55 000-byte rune-boundary chunks and sending them as **sequential
+`user_message` turns inside the same session**. Non-final chunks are
+prefixed with `[CONTEXT PART i/N — do not answer yet, just store this
+context]` so the model stores them; the last chunk is prefixed
+`[CONTEXT PART N/N — final part. Now answer based on ALL parts above.]`
+and its `text_delta` / `turn_usage` / `message_complete` frames are what
+the caller sees. Side effects to be aware of:
+
+- **One API call = N upstream turns.** A 200 KB prompt becomes ~4 model
+  turns, so upstream token cost and latency scale with chunk count.
+- Interim chunks' replies are discarded; only the last turn's reply is
+  surfaced.
+- Empty `error` frames from the upstream lose their detail — see
+  `debug.log_frames` if you need to watch the raw inbound stream.
+
 ## 5. What the "model" is
 
 `agent_mode` selects a server-side preset. Observed Nov 2026 on a LITE
