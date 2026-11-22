@@ -3,8 +3,9 @@
 > [English](README.md) | **中文**
 
 quick2api 是一个非官方协议适配器：把你 **Amazon Quick** 桌面端账号背后
-实际驱动的模型，以 OpenAI 兼容 `/v1` API 的形式暴露出来——任何标准客户
-端（Codex、OpenAI SDK、各种聊天客户端）都能像调 OpenAI 一样调它。
+实际驱动的模型，以常见的 `/v1` API（OpenAI `chat/completions` 与
+Anthropic `messages`）的形式暴露出来——任何标准客户端（OpenAI SDK、
+Claude Code、各种聊天客户端）都能像调普通端点一样调它。
 
 > **免责声明**：本项目与 Amazon 无任何关联、未获其背书。它使用你自己
 > Quick 账号的本地登录凭据（桌面应用已经存好的那一份）访问其内部
@@ -14,15 +15,20 @@ quick2api 是一个非官方协议适配器：把你 **Amazon Quick** 桌面端�
 ## 做什么
 
 ```
-你的客户端 ──OpenAI /v1/chat/completions──▶ quick2api ──AIDP WSS──▶ Amazon Quick 云端 agent
-        （流式或非流式）                          ▲
-                                  本地自起的 quickwork-agent outpost
-                                  → /auth/sncs-session → id_token
+你的客户端 ── /v1/chat/completions ──▶ quick2api ──AIDP WSS──▶ Amazon Quick 云端 agent
+           ── /v1/messages ─────────┘        ▲
+                                 本地自起的 quickwork-agent outpost
+                                 → /auth/sncs-session → id_token
 ```
 
-- `POST /v1/chat/completions` —— SSE 流式 + 非流式。
+- `POST /v1/chat/completions` —— OpenAI 接口，SSE 流式 + 非流式。
+- `POST /v1/messages` —— Anthropic Messages API（Claude Code 与
+  Anthropic SDK 走这条）；`/v1/messages/count_tokens` 作别名接受。
 - `GET /v1/models` —— 对外的 model 名 → 上游 `agent_mode` 映射。
 - `GET /healthz` —— 会话源状态（无密钥）。
+- **大 prompt 走带外通道**：超过 ~55 KB 的 `user_message` 先上传到
+  Quick 附件服务，再由一条短消息引用——一次模型回合，不切片。
+  附件不可用时回退到分片回合。
 - 用量透传：`turn_usage`（token、cache_read/write、`cost_usd`、
   `resolved_model_id`）落在 OpenAI `usage` 字段上。
 - **跑在你 Quick 登录的那台机器上**——目前是 Windows（outpost 要读桌面
@@ -70,6 +76,21 @@ curl http://127.0.0.1:8377/v1/chat/completions \
   -d '{"model":"quick","messages":[{"role":"user","content":"Reply with exactly: PONG"}],"stream":true}'
 ```
 
+或者把 **Claude Code** 指过来（Anthropic 接口面）：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8377
+export ANTHROPIC_AUTH_TOKEN=<config.yaml 里的 api.api_key>
+claude -p "say PONG"
+```
+
+要从另一台机器访问（比如 dev 服务器），保持 `server.listen` 回环，
+用 SSH 隧道：
+
+```bash
+ssh -N -R 8377:127.0.0.1:8377 user@dev-host
+```
+
 ## 配置
 
 见 [config.example.yaml](config.example.yaml)，每个键都有注释。配置查找
@@ -86,19 +107,24 @@ curl http://127.0.0.1:8377/v1/chat/completions \
 ## v1 限制
 
 - 仅文本——图片/文件 part 直接 400。
-- 客户端 tools/function calling 不做映射；Quick agent 的工具在上游跑，
-  我们只透传结果。
+- 工具是"协议面"而非运行时：`/v1/chat/completions` 拒绝客户端
+  tools；`/v1/messages` 把 tools 声明展平进 prompt、再把回复里的
+  tool_use JSON 解回 block——没有真正的工具运行时。
 - 每个请求都是新的上游会话（新 WebSocket、新 thread）：多轮对话靠把
   历史拼进 prompt；还没有服务端 thread 复用。
 - 一个上游账号 = 一个 outpost = 一条 lane；`max_concurrency` 只限本地
   并发，上游配额与桌面应用共享。
+- Quick 桌面端会话本身失效（登出/凭据被吊销）时代理没有兜底——
+  上游回 401，直到你重新登录应用为止。
 
 ## 目录
 
 ```
 cmd/quick2api/      入口（-config/-state-dir/-version/-probe）
+cmd/wsdial/         WSS 握手状态码探针（诊断工具）
 internal/app/       HTTP 路由 + 鉴权
 internal/api/openai OpenAI 适配层（/v1/chat/completions、/v1/models）
+internal/api/anthropic Anthropic 适配层（/v1/messages）
 internal/bridge/    会话源 → 聊天客户端
 internal/chat/      AIDP 双向流客户端（核心）
 internal/eventstream AWS event-stream 解码器
@@ -107,10 +133,6 @@ internal/config/    YAML 配置 + 路径解析
 internal/debuglog/  按请求一个目录的调试记录
 docs/protocol.md    线上验证过的协议实录（值得一读）
 ```
-
-## Powered by
-
-**[LINUX DO](https://linux.do/)** —— 新的理想型社区
 
 ## 许可证
 

@@ -3,9 +3,10 @@
 > **English** | [中文](README.zh-CN.md)
 
 quick2api is an unofficial protocol adapter that exposes the model your
-**Amazon Quick** desktop account talks to behind an OpenAI-compatible
-`/v1` API — so standard clients (Codex, OpenAI SDKs, any chat client) can
-call it like any other OpenAI endpoint.
+**Amazon Quick** desktop account talks to behind familiar `/v1` APIs —
+OpenAI `chat/completions` and Anthropic `messages` — so standard clients
+(OpenAI SDKs, Claude Code, any chat client) can call it like a normal
+endpoint.
 
 > **Disclaimer**: this project is not affiliated with or endorsed by Amazon.
 > It authenticates with your own Quick account credentials (the ones the
@@ -16,15 +17,22 @@ call it like any other OpenAI endpoint.
 ## What it does
 
 ```
-your client ──OpenAI /v1/chat/completions──▶ quick2api ──AIDP WSS──▶ Amazon Quick cloud agent
-        (streaming or not)                         ▲
-                                   locally-spawned quickwork-agent outpost
-                                   → /auth/sncs-session → id_token
+your client ── /v1/chat/completions ──▶ quick2api ──AIDP WSS──▶ Amazon Quick cloud agent
+            ── /v1/messages ─────────┘        ▲
+                                  locally-spawned quickwork-agent outpost
+                                  → /auth/sncs-session → id_token
 ```
 
-- `POST /v1/chat/completions` — streaming (SSE) and non-streaming.
+- `POST /v1/chat/completions` — OpenAI, streaming (SSE) and non-streaming.
+- `POST /v1/messages` — Anthropic Messages API (the surface Claude Code
+  and Anthropic SDKs speak); `/v1/messages/count_tokens` is accepted as
+  an alias.
 - `GET /v1/models` — advertised model names mapped to upstream `agent_mode` values.
 - `GET /healthz` — session source status, no secrets.
+- **Large prompts go out-of-band**: a `user_message` over ~55 KB is
+  uploaded to Quick's attachment service and referenced from a short
+  message — one model turn, not N chunk turns. Falls back to chunked
+  turns when attachments are unavailable.
 - Usage pass-through: `turn_usage` (tokens, cache read/write, `cost_usd`,
   `resolved_model_id`) lands on the OpenAI `usage` object.
 - **Runs where your Quick login runs** — Windows today (the outpost reads
@@ -78,6 +86,21 @@ curl http://127.0.0.1:8377/v1/chat/completions \
   -d '{"model":"quick","messages":[{"role":"user","content":"Reply with exactly: PONG"}],"stream":true}'
 ```
 
+Or point **Claude Code** at it (the Anthropic surface):
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8377
+export ANTHROPIC_AUTH_TOKEN=<api.api_key from config.yaml>
+claude -p "say PONG"
+```
+
+To use it from another machine (e.g. a dev server), keep `server.listen`
+on loopback and tunnel:
+
+```bash
+ssh -N -R 8377:127.0.0.1:8377 user@dev-host
+```
+
 ## Configuration
 
 See [config.example.yaml](config.example.yaml) — every key is annotated.
@@ -95,20 +118,26 @@ The knobs you're most likely to touch:
 ## Limitations (v1)
 
 - Text only — image/file parts are rejected with a 400.
-- Client-side tools/function calling is not mapped; the Quick agent runs
-  its own tools upstream and we stream the result.
+- Tools are advisory: `/v1/chat/completions` rejects client-side tools;
+  `/v1/messages` flattens tool declarations into the prompt and parses
+  tool_use JSON back out of the reply — there is no real tool runtime.
 - Each request is a fresh upstream session (fresh WebSocket, fresh
   thread). Multi-turn works because the transcript is flattened into the
   prompt; there is no server-side thread reuse yet.
 - One upstream account = one outpost = one lane; `max_concurrency` bounds
   pressure but upstream quota is shared with your app usage.
+- If the Quick desktop session itself dies (logged out / token revoked),
+  the proxy has no fallback — the upstream answers 401 and turns fail
+  until you sign back in to the app.
 
 ## Project layout
 
 ```
 cmd/quick2api/      entrypoint (-config/-state-dir/-version/-probe)
+cmd/wsdial/         WSS handshake status probe (diagnostics)
 internal/app/       HTTP wiring + auth
 internal/api/openai OpenAI adapter (/v1/chat/completions, /v1/models)
+internal/api/anthropic Anthropic adapter (/v1/messages)
 internal/bridge/    session source → chat client
 internal/chat/      AIDP bidirectional-stream client (the core)
 internal/eventstream AWS event-stream decoder
@@ -117,10 +146,6 @@ internal/config/    YAML config + path resolution
 internal/debuglog/  per-request debug directories
 docs/protocol.md    the wire facts (worth reading)
 ```
-
-## Powered by
-
-**[LINUX DO](https://linux.do/)** — 新的理想型社区 · The new ideal community
 
 ## License
 

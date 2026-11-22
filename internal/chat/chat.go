@@ -7,7 +7,10 @@
 //	URL:  wss://<wsHost>/streaming/quickwork-chat-bidirectional-stream
 //	      ?surfaceType=<QUICK_WORK_DESKTOP_WINDOWS>
 //	      &token=<id_token>
-//	      &outpostId=<any string>
+//	      &outpostId=<registered outpost device id>  — must be the id the
+//	      outpost registered itself under (GET /local/list_tools →
+//	      outpost_id); an arbitrary value gets a close-1000 right after
+//	      session_established
 //	      &workingSessionId=<uuid>
 //	      &channel=prod
 //	Header: Origin: https://quick.aws.com   (required — without it the

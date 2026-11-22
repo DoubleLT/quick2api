@@ -64,7 +64,7 @@ WS-only.
 wss://<ws_host>/streaming/quickwork-chat-bidirectional-stream
     ?surfaceType=QUICK_WORK_DESKTOP_WINDOWS
     &token=<id_token>            # percent-encoded
-    &outpostId=<any string>
+    &outpostId=<registered outpost device id>   # NOT arbitrary — see below
     &workingSessionId=<uuid>
     &channel=prod
 Header: Origin: https://quick.aws.com     # required — no Origin, no upgrade

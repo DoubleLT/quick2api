@@ -28,6 +28,8 @@ AIDP 双向流 WebSocket 反代成 OpenAI `/v1`。协议事实全部记录在
 - `internal/eventstream/` — AWS event-stream 解码，字节级，别"顺手重构"。
 - `internal/session/` — outpost 生命周期 + sncs-session 获取。
 - `internal/api/openai/` — OpenAI ↔ Quick 映射（SSE/usage/错误契约）。
+- `internal/api/anthropic/` — Anthropic `/v1/messages` ↔ 同一条 Quick turn
+  （Claude Code 走这里；tools 只做协议面展平/解析，没有运行时）。
 - `internal/bridge/` — 会话源策略与刷新。
 
 ## 验证

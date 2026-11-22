@@ -52,11 +52,11 @@ func resolvedVersion() string {
 }
 
 func main() {
-	configPath := flag.String("config", "", "YAML 配置文件路径；缺省按 $QUICK2API_CONFIG → ./config.yaml → 平台默认目录解析")
-	stateDir := flag.String("state-dir", "", "调试日志与状态目录；缺省按 $QUICK2API_STATE_DIR → 平台默认目录解析")
-	showVersion := flag.Bool("version", false, "打印构建版本后退出")
-	probe := flag.Bool("probe", false, "起桥 + 发一条探针消息验证上游链路后退出（不起服务）")
-	probeText := flag.String("probe-text", "Reply with exactly: PONG", "配合 -probe 使用的探针消息")
+	configPath := flag.String("config", "", "path to config.yaml; default resolves $QUICK2API_CONFIG → ./config.yaml → platform user-config dir")
+	stateDir := flag.String("state-dir", "", "debug/state dir; default resolves $QUICK2API_STATE_DIR → platform state dir")
+	showVersion := flag.Bool("version", false, "print the resolved build version and exit")
+	probe := flag.Bool("probe", false, "verify the upstream chain end-to-end (outpost → session → WSS → one turn) and exit without serving")
+	probeText := flag.String("probe-text", "Reply with exactly: PONG", "probe message sent with -probe")
 	flag.Parse()
 
 	resolved := resolvedVersion()
