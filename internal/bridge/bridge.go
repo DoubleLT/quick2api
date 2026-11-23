@@ -33,6 +33,7 @@ type Bridge struct {
 	// past cfg.MaxPooledConns() the oldest is evicted — both bounds keep a
 	// long-running process from accumulating dead sockets.
 	conns map[string]*connEntry
+	turns conversationLocks
 	// lastUpErr keeps the most recent upstream error for /healthz so the
 	// endpoint can report degraded state instead of a bare "ok".
 	lastUpErr error
@@ -212,6 +213,11 @@ func (b *Bridge) ChatClient() *chat.Client {
 // failure refreshes the sncs-session and retries on a fresh conn.
 func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
 	opts.ConversationID = normalizeConvID(opts.ConversationID)
+	release, err := b.turns.acquire(ctx, opts.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	sess, err := b.Session(false)
 	if err != nil {
 		b.noteErr(err)
@@ -227,7 +233,13 @@ func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnRes
 		// drop it and fall through to a fresh dial.
 		b.dropConn(opts.ConversationID)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
+	// The one-shot fallback also reseeds the complete transcript. The client
+	// id must never reopen an existing upstream thread without its watermark.
+	opts.ConversationID = ""
 	res, err := b.ChatClient().RunTurn(ctx, sess, opts)
 	if err != nil {
 		var ue *chat.UpstreamError
@@ -304,7 +316,8 @@ func retryable(err error) bool {
 func (b *Bridge) sendOnPool(ctx context.Context, sess *session.Session, opts chat.TurnOpts) (*chat.TurnResult, error) {
 	b.mu.Lock()
 	e := b.conns[opts.ConversationID]
-	if e != nil && !e.conn.Alive() {
+	if e != nil && !e.conn.CanContinue(opts) {
+		e.conn.Close()
 		delete(b.conns, opts.ConversationID)
 		e = nil
 	}
@@ -312,7 +325,10 @@ func (b *Bridge) sendOnPool(ctx context.Context, sess *session.Session, opts cha
 
 	if e == nil {
 		var err error
-		cn, err := b.ChatClient().NewConversation(ctx, sess, opts.ConversationID)
+		// The client id identifies a local transcript, not an upstream thread.
+		// A fresh connection has no watermark and must seed a fresh thread;
+		// reconnecting the old upstream id would append the entire history twice.
+		cn, err := b.ChatClient().NewConversation(ctx, sess, "")
 		if err != nil {
 			b.noteErr(err)
 			return nil, err

@@ -136,10 +136,47 @@ Two things that bite if skipped:
 ```
 
 Also possible mid-turn: `tool_start` / `tool_arguments` / `tool_progress` /
-`tool_result` / `tool_error` (the agent runs its own tools upstream — we
-just pass through and ignore them), `error` `{code,message}`,
+`tool_result` / `tool_error` (the agent runs its own tools upstream; use their
+boundaries to separate text spans, not as client tool calls), `error` `{code,message}`,
 `guardrail_blocked`, `session_end`, `session_title_updated`, various
 `*_sync` housekeeping frames.
+
+### Conversation reuse and content-filter errors (2026-11-23)
+
+The upstream thread is stateful. A downstream conversation id is a local
+transcript key, not permission to append concurrent prompts to one upstream
+thread. Live regression: two overlapping requests with the same client id
+asked for an ALPHA sequence and BETA_COMPLETE respectively; both returned the
+ALPHA sequence before serialization was added. Serialize lane selection, first
+dial and Send per client conversation. Reuse a connection only for an
+append-only transcript with an unchanged preamble. Seed divergent histories
+and reopened connections into fresh upstream UUIDs; replaying a full transcript
+against its old server-side UUID duplicates context.
+
+Content filtering can also arrive as an `error` frame with this observed
+payload (a real Desktop fork), rather than `guardrail_blocked`:
+
+```json
+{"error":"The model's content filter stopped this reply. Rephrase, or start a new chat.","error_code":"content_filtered","initiator":"user"}
+```
+
+Map this to `content_filter` (Anthropic `stop_reason: refusal`), not a generic
+unavailable-model error. Do not retry it through the chunk fallback. After an
+error, cancellation, partial close, or guardrail termination, close the socket
+and discard its pending frames rather than pooling an ambiguous turn boundary.
+This preserves upstream checks; it does not remove Quick's agent constraints.
+
+### Native-tool narration before client tool JSON (2026-11-23)
+
+Observed in two actual Desktop requests: three `text_delta` events announce
+an attachment read, followed by two native `tool_start` / `tool_result` pairs,
+then the final text span contains a complete client `tool_use` JSON object.
+Concatenating all text makes the answer look like
+`I'll read the attached context first.{"type":"tool_use",...}` and defeats
+whole-response JSON parsing. Track the byte offset of the latest native tool
+boundary. Only that final text span is eligible for client-tool JSON parsing;
+ordinary text responses retain all text. Do not extract arbitrary embedded JSON
+from prose, and never convert blocked or incomplete output into a tool call.
 
 ### Per-message text limit (~64–80 KB)
 

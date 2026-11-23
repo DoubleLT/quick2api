@@ -33,6 +33,7 @@ type Lane struct {
 type Pool struct {
 	lanes []*Lane
 	next  atomic.Uint32
+	turns conversationLocks
 }
 
 // BuildPool constructs one Lane per accounts entry. When accounts is
@@ -141,6 +142,13 @@ func (l *Lane) cool(err error) {
 // rotates live lanes. Auth-type failures cool the lane and retry once on
 // another lane.
 func (p *Pool) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
+	// Lock before lane selection: two first requests for one conversation
+	// must not open independent connections on different lanes.
+	release, err := p.turns.acquire(ctx, normalizeConvID(opts.ConversationID))
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if opts.ConversationID != "" {
 		if l := p.ownerOf(normalizeConvID(opts.ConversationID)); l != nil {
 			return l.Bridge.RunTurn(ctx, opts)

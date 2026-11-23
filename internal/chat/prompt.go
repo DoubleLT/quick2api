@@ -31,6 +31,10 @@ const maxSingleText = 55_000
 // re-inference. If the attachment path fails it falls back to sequential
 // user_message turns with context-priming prefixes.
 func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string, opts TurnOpts, sess *session.Session) (*TurnResult, error) {
+	opts.Text = appendPromptSuffix(opts.Text, opts.Suffix)
+	if opts.Final != "" {
+		opts.Final = appendPromptSuffix(opts.Final, opts.Suffix)
+	}
 
 	// 1. Upload any caller-provided attachments (multimodal input). Image
 	// and file parts ride the out-of-band upload-attachment channel — the
@@ -106,6 +110,9 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 				return nil, err
 			}
 			res, err := t.collect(ctx, &TurnResult{FinishReason: "stop"})
+			if err != nil || res == nil || res.FinishReason == "content_filter" || res.PartialOnClose {
+				return res, err
+			}
 			if err == nil && res != nil && res.Text != "" {
 				slog.Debug("attachment path succeeded", "path", path)
 				return res, nil
@@ -133,11 +140,26 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 		if err != nil {
 			return nil, err
 		}
+		if got.FinishReason == "content_filter" || got.PartialOnClose {
+			return got, nil
+		}
 		if i == len(chunks)-1 {
 			last = got
 		}
 	}
 	return last, nil
+}
+
+func appendPromptSuffix(text, suffix string) string {
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "" {
+		return text
+	}
+	text = strings.TrimRight(text, "\r\n")
+	if text == "" {
+		return suffix
+	}
+	return text + "\n\n" + suffix
 }
 
 // sendUserMessage emits one user_message frame; attachments, when given,

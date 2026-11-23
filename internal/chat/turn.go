@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,19 @@ type turn struct {
 	ws   *websocket.Conn
 	in   chan inbound
 	emit func(TurnEvent)
+	done chan struct{}
+	once sync.Once
+}
+
+func (t *turn) close() {
+	t.once.Do(func() {
+		if t.done != nil {
+			close(t.done)
+		}
+		if t.ws != nil {
+			t.ws.Close()
+		}
+	})
 }
 
 // dialer builds the configured WebSocket dialer (proxy resolution and
@@ -179,6 +193,7 @@ type Conn struct {
 	// its validity ends with the thread — a dropped conn reseeds on the
 	// next Send. Serial per-conn Sends keep it race-free.
 	sentTail string
+	sentHead string
 }
 
 // NewConversation dials and handshakes a persistent upstream conversation.
@@ -204,11 +219,12 @@ func (c *Client) NewConversation(ctx context.Context, sess *session.Session, con
 		ws:   ws,
 		in:   make(chan inbound, 64),
 		emit: func(TurnEvent) {},
+		done: make(chan struct{}),
 	}
 	cn := &Conn{c: c, t: t, convID: conversationID, sess: sess}
 	go cn.pump(t)
 	if err := c.handshake(ctx, t, sess, outpostID, conversationID, ""); err != nil {
-		ws.Close()
+		t.close()
 		return nil, err
 	}
 	return cn, nil
@@ -230,9 +246,30 @@ func (cn *Conn) ConversationID() string { return cn.convID }
 // Close shuts the underlying socket.
 func (cn *Conn) Close() {
 	cn.dead.Store(true)
-	if cn.t != nil && cn.t.ws != nil {
-		cn.t.ws.Close()
+	if cn.t != nil {
+		cn.t.close()
 	}
+}
+
+// CanContinue is called under the bridge's conversation lock. A stateless
+// transcript that diverges (fork, compaction, model probe, or suggestion) must
+// be seeded into a fresh upstream thread, rather than appended to this one.
+func (cn *Conn) CanContinue(opts TurnOpts) bool {
+	if !cn.Alive() {
+		return false
+	}
+	if opts.Tail == "" || cn.sentTail == "" {
+		return true
+	}
+	return transcriptHead(opts) == cn.sentHead && len(opts.Tail) > len(cn.sentTail) &&
+		strings.HasPrefix(opts.Tail, cn.sentTail)
+}
+
+func transcriptHead(opts TurnOpts) string {
+	if opts.Tail != "" && strings.HasSuffix(opts.Text, opts.Tail) {
+		return opts.Text[:len(opts.Text)-len(opts.Tail)]
+	}
+	return ""
 }
 
 // Send runs one user_message turn on this connection. The emit sink is
@@ -246,14 +283,23 @@ func (cn *Conn) Send(ctx context.Context, sess *session.Session, opts TurnOpts) 
 			opts.OnEvent(ev)
 		}
 	}
+	head := transcriptHead(opts)
 	send, commit := deltaTail(cn.sentTail, opts.Text, opts.Tail)
 	if send != opts.Text {
 		slog.Info("delta turn", "send_bytes", len(send), "tail_bytes", len(opts.Tail))
 	}
 	opts.Text = send
 	res, err := cn.c.sendPrompt(ctx, cn.t, cn.convID, opts, sess)
-	if err == nil {
+	if err == nil && res != nil && res.FinishReason == "stop" && !res.PartialOnClose {
 		cn.sentTail = commit
+		if opts.Tail != "" {
+			cn.sentHead = head
+		}
+	} else {
+		// Cancellation, errors, and guardrail termination do not establish a
+		// clean message_complete boundary. Never let queued frames reach the
+		// next HTTP request, and do not advance the history watermark.
+		cn.Close()
 	}
 	if err != nil && !cn.Alive() {
 		// Connection died mid-turn — mark it so the pool drops it.
@@ -347,6 +393,11 @@ func (t *turn) collect(ctx context.Context, res *TurnResult) (*TurnResult, error
 			f := in.f
 			t.emit(TurnEvent{Kind: "frame", Frame: f})
 			switch f.Type {
+			case "tool_start", "tool_result", "tool_error":
+				// Native Quick tools (such as reading context.txt) separate
+				// progress narration from the subsequent client-tool reply.
+				// Do not search arbitrary prose for executable JSON.
+				res.ToolTextOffset = len(res.Text)
 			case "text_delta", "thinking_delta":
 				var p struct {
 					Delta string `json:"delta"`
@@ -382,10 +433,30 @@ func (t *turn) collect(ctx context.Context, res *TurnResult) (*TurnResult, error
 				return res, nil
 			case "error":
 				var p struct {
-					Code    string `json:"code"`
-					Message string `json:"message"`
+					Code      string `json:"code"`
+					Message   string `json:"message"`
+					ErrorCode string `json:"error_code"`
+					Error     string `json:"error"`
 				}
 				_ = json.Unmarshal(f.Payload, &p)
+				if p.Code == "" {
+					p.Code = p.ErrorCode
+				}
+				if p.Message == "" {
+					p.Message = p.Error
+				}
+				// Observed on a real Desktop fork: the content filter also
+				// uses error_code/error rather than guardrail_blocked. This
+				// is a refusal, not a broken/unavailable model or a retry.
+				if p.Code == "content_filtered" {
+					res.FinishReason = "content_filter"
+					if res.Text == "" {
+						res.Text = orElse(p.Message, "Quick's content check blocked this response.")
+						t.emit(TurnEvent{Kind: "delta", Text: res.Text})
+					}
+					t.emit(TurnEvent{Kind: "done"})
+					return res, nil
+				}
 				msg := p.Message
 				if msg == "" {
 					msg = string(f.Payload)

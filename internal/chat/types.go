@@ -39,11 +39,23 @@ type TurnUsage struct {
 
 // TurnResult is the completed turn.
 type TurnResult struct {
-	Text           string
+	Text string
+	// ToolTextOffset marks the latest native tool boundary in Text. Quick
+	// may narrate an attachment read before using its own tools, then emit
+	// client tool JSON afterwards. Keep all text for display, but only the
+	// final uninterrupted text span is eligible for client-tool parsing.
+	ToolTextOffset int
 	FinishReason   string // "stop" | "content_filter" | "error"
 	Usage          *TurnUsage
 	ResolvedModel  string
 	PartialOnClose bool
+}
+
+func (r *TurnResult) ToolText() string {
+	if r.ToolTextOffset >= 0 && r.ToolTextOffset <= len(r.Text) {
+		return r.Text[r.ToolTextOffset:]
+	}
+	return r.Text
 }
 
 // TurnEvent is a streaming callback event.
@@ -77,14 +89,19 @@ type TurnOpts struct {
 	// keeps the tail it last sent as a shadow transcript — when this
 	// request's Tail continues that shadow, only the unsent suffix goes
 	// upstream: the stateless-API full transcript becomes a delta-append
-	// on the stateful thread. Any mismatch falls back to full Text, so a
-	// bad delta decision never does worse than today's retransmission.
+	// on the stateful thread. The bridge reseeds divergent transcripts on a
+	// fresh upstream thread rather than replaying them into the old one.
 	Tail string
-	// Final is the rendered last message of the transcript ("User: ...",
-	// "ToolResult: ..." — the operative instruction). The oversized-prompt
+	// Final is the rendered operative message and any trailing environment
+	// context ("User: ...", "ToolResult: ..."). The oversized-prompt
 	// path keeps it inline in the user_message so the model answers a real
 	// turn instead of analyzing an uploaded transcript document.
 	Final string
+	// Suffix is appended to the actual text sent for this turn, after delta
+	// selection, but is excluded from Tail's append-only watermark. This is
+	// for short per-turn protocol reminders that must stay near the operative
+	// message without forcing a full transcript resend on the next request.
+	Suffix string
 	// OnEvent is invoked synchronously from the read loop; implementations
 	// should be fast or hand off to a channel.
 	OnEvent func(TurnEvent)
