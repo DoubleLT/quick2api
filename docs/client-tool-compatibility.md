@@ -29,6 +29,34 @@ final text span is eligible for client-tool JSON parsing in either API adapter.
 Ordinary replies retain all text. Arbitrary JSON embedded in prose is not
 extracted as an executable command.
 
+### A short action sentence and tool JSON share the final text span
+
+A separate Desktop trace on 2026-11-24 contained both of these in the final
+span, after the last native tool boundary:
+
+```text
+Need to find the shell session's local id.
+
+{"type":"tool_use","id":"example","name":"list_sessions","input":{"limit":10}}
+```
+
+The Anthropic client-passthrough adapter now accepts one short action paragraph,
+a blank line, and a complete terminal tool object or array. It preserves the
+paragraph as text and emits separate `tool_use` blocks with `stop_reason:
+tool_use`. The tool name must match the current request's catalog and its input
+must validate against that tool's JSON Schema. Tool choice restrictions apply;
+external schema references cannot load URLs or files. Duplicate JSON keys,
+duplicate call IDs, extra wrapper fields, incomplete replies, and filtered
+replies cannot be promoted.
+
+This is a narrow formatting heuristic, not a reliable semantic intent classifier.
+Recognized action prefixes are limited; examples, negation, mixed fenced JSON,
+additional paragraphs, and trailing prose remain text. Unrecognized wording may
+still fail to produce a tool call. Client permissions remain the execution gate.
+This extension applies only to Anthropic client passthrough; OpenAI parsing and
+server tool execution retain their existing behavior. No prompt rewriting,
+content-filter retry, or native device bridge is introduced.
+
 ### Large histories lose the operative request or tool schema
 
 Oversized prompts use the existing attachment path. Trailing environment
@@ -68,7 +96,9 @@ Automated checks: `go test ./...`, `go vet ./...`, and `go build ./...` on
 Windows/amd64 with Go 1.27.4. Regression cases cover stream event types,
 operative-message placement, schema constraints, cancellable conversation
 locks, transcript divergence, abandoned queues, filtering, and final-span
-tool parsing. These are local parser/state tests, not simulated upstream
+tool parsing. Additional regressions cover the 2026-11-24 mixed final span,
+schema validation, tool choice, multiple tool blocks, and single-delivery SSE
+arguments. These are local parser/state tests, not simulated upstream
 proof.
 
 Live checks against a signed-in Quick account established:
@@ -87,6 +117,12 @@ Live checks against a signed-in Quick account established:
   failure shape. Its parser regression passes. The successful Desktop retry
   did not repeat the exact initial-narration sequence, so it is not an exact
   before/after replay of that failure.
+- On 2026-11-24, a separate candidate server completed both non-streaming and
+  streaming fixture Read/result/final-answer loops against real Quick. The SSE
+  check verified event types, block closure, empty starting inputs, and one
+  argument delta per call. The exact mixed final-span reply is covered by a
+  local regression; those live loops did not establish a Desktop replay of
+  that precise formatting or resolve refusals in large old histories.
 
 For an installation check, build `./cmd/quick2api` and run
 `quick2api -config <your-config> -probe`. Use a proxy-owned outpost and a

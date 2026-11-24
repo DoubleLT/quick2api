@@ -5,12 +5,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kilbertert/quick2api/internal/api/common"
 	"github.com/kilbertert/quick2api/internal/chat"
 )
 
 func TestRefusalDoesNotBecomeSuccessfulToolCall(t *testing.T) {
 	toolJSON := `{"type":"tool_use","name":"Bash","input":{"command":"echo test"}}`
-	content, stop := responseContent(&chat.TurnResult{Text: toolJSON, FinishReason: "content_filter"})
+	content, stop := responseContent(&chat.TurnResult{Text: toolJSON, FinishReason: "content_filter"}, nil)
 	if stop != "refusal" || len(content) != 1 || content[0].Type != "text" || content[0].Text != toolJSON {
 		t.Fatalf("blocked output became a tool invocation: %s %+v", stop, content)
 	}
@@ -20,20 +21,20 @@ func TestClientToolReplyAfterNativeProgress(t *testing.T) {
 	const progress = "先读取附件上下文。"
 	const toolJSON = `{"type":"tool_use","id":"toolu_test","name":"Bash","input":{"command":"echo TOOL_BOUNDARY_OK"}}`
 	res := &chat.TurnResult{Text: progress + toolJSON, ToolTextOffset: len(progress), FinishReason: "stop"}
-	content, stop := responseContent(res)
+	content, stop := responseContent(res, nil)
 	if stop != "tool_use" || len(content) != 1 || content[0].Name != "Bash" || string(content[0].Input) != `{"command":"echo TOOL_BOUNDARY_OK"}` {
 		t.Fatalf("native progress hid client tool invocation: %s %+v", stop, content)
 	}
 	// Without a native tool boundary this is arbitrary prose containing
 	// JSON, not an instruction to extract and execute the embedded object.
 	res.ToolTextOffset = 0
-	content, stop = responseContent(res)
+	content, stop = responseContent(res, nil)
 	if stop != "end_turn" || content[0].Type != "text" || content[0].Text != res.Text {
 		t.Fatalf("prose was promoted to a tool call: %s %+v", stop, content)
 	}
 	res.ToolTextOffset = len(progress)
 	res.FinishReason = "content_filter"
-	content, stop = responseContent(res)
+	content, stop = responseContent(res, nil)
 	if stop != "refusal" || content[0].Type != "text" {
 		t.Fatalf("blocked reply became a tool call: %s %+v", stop, content)
 	}
@@ -41,9 +42,104 @@ func TestClientToolReplyAfterNativeProgress(t *testing.T) {
 
 func TestNormalReplyRetainsNativeProgress(t *testing.T) {
 	res := &chat.TurnResult{Text: "Reading context.\nHere is the summary.", ToolTextOffset: len("Reading context.\n"), FinishReason: "stop"}
-	content, stop := responseContent(res)
+	content, stop := responseContent(res, nil)
 	if stop != "end_turn" || content[0].Text != res.Text {
 		t.Fatalf("normal reply lost text: %s %+v", stop, content)
+	}
+}
+
+const desktopTools = `[{"name":"mcp__ccd_session_mgmt__list_sessions","input_schema":{"type":"object","properties":{"limit":{"type":"number"}},"additionalProperties":false}}]`
+const desktopCall = `{"type":"tool_use","id":"toolu_ls01","name":"mcp__ccd_session_mgmt__list_sessions","input":{"limit":10}}`
+const desktopNarration = "Need to find the shell session's local id."
+
+func TestDesktopNarrationAndToolReply(t *testing.T) {
+	catalog := common.NewClientTools(json.RawMessage(desktopTools), nil)
+	for _, nativeProgress := range []string{"", "Reading attachment context."} {
+		res := &chat.TurnResult{Text: nativeProgress + desktopNarration + "\n\n" + desktopCall, ToolTextOffset: len(nativeProgress), FinishReason: "stop"}
+		content, stop := responseContent(res, catalog)
+		if stop != "tool_use" || len(content) != 2 || content[0].Type != "text" || content[0].Text != desktopNarration || content[1].Type != "tool_use" || content[1].ID != "toolu_ls01" || content[1].Name != "mcp__ccd_session_mgmt__list_sessions" || string(content[1].Input) != `{"limit":10}` {
+			t.Fatalf("Desktop reply was not mapped: stop=%s content=%+v", stop, content)
+		}
+	}
+}
+
+func TestDesktopToolPromotionRequiresCompleteAllowedReply(t *testing.T) {
+	for _, test := range []struct {
+		name, finish, tools, choice, stop string
+		partial, server                   bool
+	}{
+		{name: "filtered", finish: "content_filter", tools: desktopTools, stop: "refusal"},
+		{name: "partial", finish: "stop", tools: desktopTools, partial: true, stop: "end_turn"},
+		{name: "unfinished", tools: desktopTools, stop: "end_turn"},
+		{name: "undeclared", finish: "stop", tools: `[]`, stop: "end_turn"},
+		{name: "disabled", finish: "stop", tools: desktopTools, choice: `{"type":"none"}`, stop: "end_turn"},
+		{name: "server mode", finish: "stop", server: true, stop: "end_turn"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var catalog *common.ClientTools
+			if !test.server {
+				catalog = common.NewClientTools(json.RawMessage(test.tools), json.RawMessage(test.choice))
+			}
+			res := &chat.TurnResult{Text: desktopNarration + "\n\n" + desktopCall, FinishReason: test.finish, PartialOnClose: test.partial}
+			content, stop := responseContent(res, catalog)
+			if stop != test.stop || len(content) != 1 || content[0].Type != "text" || content[0].Text != res.Text {
+				t.Fatalf("inert reply was promoted: %s %+v", stop, content)
+			}
+		})
+	}
+}
+
+func TestDesktopParallelToolSSE(t *testing.T) {
+	second := strings.Replace(desktopCall, `"toolu_ls01"`, `"toolu_ls02"`, 1)
+	catalog := common.NewClientTools(json.RawMessage(desktopTools), nil)
+	content, stop := responseContent(&chat.TurnResult{Text: desktopNarration + "\n\n[" + desktopCall + "," + second + "]", FinishReason: "stop"}, catalog)
+	if stop != "tool_use" || len(content) != 3 {
+		t.Fatalf("parallel calls lost: %s %+v", stop, content)
+	}
+	var wire strings.Builder
+	emitToolBlocks(func(event string, data map[string]any) bool { return writeSSE(&wire, event, data) == nil }, content)
+	packets := strings.Split(strings.TrimSpace(wire.String()), "\n\n")
+	if len(packets) != 6 {
+		t.Fatalf("want three events per tool, got %d", len(packets))
+	}
+	for i, packet := range packets {
+		lines := strings.Split(packet, "\n")
+		var event struct {
+			Type  string       `json:"type"`
+			Index int          `json:"index"`
+			Block ContentBlock `json:"content_block"`
+			Delta struct {
+				Type string `json:"type"`
+				JSON string `json:"partial_json"`
+			} `json:"delta"`
+		}
+		if len(lines) != 2 || json.Unmarshal([]byte(strings.TrimPrefix(lines[1], "data: ")), &event) != nil || lines[0] != "event: "+event.Type || event.Index != 1+i/3 {
+			t.Fatalf("invalid SSE packet: %s", packet)
+		}
+		switch i % 3 {
+		case 0:
+			if event.Type != "content_block_start" || event.Block.Type != "tool_use" || string(event.Block.Input) != `{}` || event.Block.ID != content[1+i/3].ID {
+				t.Fatalf("bad tool start: %s", packet)
+			}
+		case 1:
+			if event.Type != "content_block_delta" || event.Delta.Type != "input_json_delta" || event.Delta.JSON != `{"limit":10}` {
+				t.Fatalf("bad input delta: %s", packet)
+			}
+		case 2:
+			if event.Type != "content_block_stop" {
+				t.Fatalf("bad tool stop: %s", packet)
+			}
+		}
+	}
+	if strings.Contains(wire.String(), "text_delta") || strings.Count(wire.String(), "partial_json") != 2 {
+		t.Fatal("tool JSON leaked as text or duplicate arguments")
+	}
+	for _, failAt := range []int{1, 2, 3} {
+		count := 0
+		emitToolBlocks(func(string, map[string]any) bool { count++; return count < failAt }, content)
+		if count != failAt {
+			t.Fatalf("continued after emit failure: %d", count)
+		}
 	}
 }
 

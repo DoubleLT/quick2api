@@ -205,11 +205,15 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 
 	exec := h.execFor(clientTools)
 	runtimeSuffix := common.CompactToolsInstruction(req.Tools)
+	var catalog *common.ClientTools
+	if !exec {
+		catalog = common.NewClientTools(req.Tools, req.ToolChoice)
+	}
 	if req.Stream {
-		h.stream(w, ctx, reqID, model, agentMode, thinking, text, tail, final, atts, conversationID, exec, runtimeSuffix, dlogDir)
+		h.stream(w, ctx, reqID, model, agentMode, thinking, text, tail, final, atts, conversationID, exec, runtimeSuffix, dlogDir, catalog)
 		return
 	}
-	h.complete(w, ctx, reqID, model, agentMode, thinking, text, tail, final, atts, conversationID, exec, runtimeSuffix, dlogDir)
+	h.complete(w, ctx, reqID, model, agentMode, thinking, text, tail, final, atts, conversationID, exec, runtimeSuffix, dlogDir, catalog)
 }
 
 // clientHasTools reports whether the client declared its own tool
@@ -257,7 +261,7 @@ func conversationIDOf(r *http.Request, req *MessagesRequest) string {
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 	reqID, model, agentMode, thinking, text, tail, final string,
-	atts []chat.Attachment, conversationID string, exec bool, runtimeSuffix, dlogDir string) {
+	atts []chat.Attachment, conversationID string, exec bool, runtimeSuffix, dlogDir string, catalog *common.ClientTools) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, final, atts,
@@ -271,7 +275,7 @@ func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 		return
 	}
 
-	content, stopReason := responseContent(res)
+	content, stopReason := responseContent(res, catalog)
 	out := anthropicMessage{
 		ID:         "msg_" + reqID,
 		Type:       "message",
@@ -407,7 +411,7 @@ func (h *Handler) runAgent(ctx context.Context,
 // event, and the final non-tool round's text is emitted as one delta.
 func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	reqID, model, agentMode, thinking, text, tail, final string,
-	atts []chat.Attachment, conversationID string, exec bool, runtimeSuffix, dlogDir string) {
+	atts []chat.Attachment, conversationID string, exec bool, runtimeSuffix, dlogDir string, catalog *common.ClientTools) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -479,15 +483,18 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 		})
 	frames.Write(h.Debug, dlogDir)
 
-	if err == nil && res != nil && !liveDeltas {
-		// The final text was buffered — emit it now as one delta, unless
-		// it parses as tool calls (emitted as a tool_use block below).
-		if content, _ := responseContent(res); len(content) == 1 && content[0].Type == "text" {
-			emit("content_block_delta", map[string]any{
-				"index": 0,
-				"delta": map[string]any{"type": "text_delta", "text": res.Text},
-			})
-		}
+	var content []ContentBlock
+	var stopReason string
+	if err == nil && res != nil {
+		content, stopReason = responseContent(res, catalog)
+	}
+	if !liveDeltas && len(content) > 0 && content[0].Type == "text" {
+		// Narration and tool calls are distinct blocks. Never stream the
+		// original JSON as text before classifying a buffered reply.
+		emit("content_block_delta", map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": content[0].Text},
+		})
 	}
 
 	// close the text block even on error — clients expect a terminated stream
@@ -506,27 +513,7 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 		return
 	}
 
-	// If the whole answer is a tool call, translate it into a tool_use block
-	// (still a single block; legal to emit after the text block closes).
-	content, stopReason := responseContent(res)
-	if len(content) == 1 && content[0].Type == "tool_use" {
-		// Arguments arrive once via input_json_delta. Supplying them in the
-		// start event as well makes clients merge the same input twice.
-		startBlock := content[0]
-		startBlock.Input = json.RawMessage(`{}`)
-		emit("content_block_start", map[string]any{
-			"index":         1,
-			"content_block": startBlock,
-		})
-		emit("content_block_delta", map[string]any{
-			"index": 1,
-			"delta": map[string]any{
-				"type":         "input_json_delta",
-				"partial_json": string(content[0].Input),
-			},
-		})
-		emit("content_block_stop", map[string]any{"index": 1})
-	}
+	emitToolBlocks(emit, content)
 
 	u := mapUsage(res.Usage)
 	emit("message_delta", map[string]any{
@@ -551,15 +538,59 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 
 // A blocked answer must remain a refusal even if its partial text resembles
 // tool-call JSON. Never execute it or advertise a normal successful turn.
-func responseContent(res *chat.TurnResult) ([]ContentBlock, string) {
+func responseContent(res *chat.TurnResult, catalog *common.ClientTools) ([]ContentBlock, string) {
 	if res.FinishReason == "content_filter" {
 		return []ContentBlock{{Type: "text", Text: res.Text}}, "refusal"
 	}
-	content := parseToolCalls(res.ToolText())
-	if len(content) == 1 && content[0].Type == "tool_use" {
-		return content, "tool_use"
+	if !res.PartialOnClose && res.FinishReason == "stop" {
+		if catalog != nil {
+			if narration, calls, ok := catalog.ParseReply(res.ToolText()); ok {
+				content := make([]ContentBlock, 0, len(calls)+1)
+				if narration != "" {
+					content = append(content, ContentBlock{Type: "text", Text: narration})
+				}
+				for _, call := range calls {
+					id := call.ID
+					if id == "" {
+						id = common.NewID("toolu")
+					}
+					content = append(content, ContentBlock{Type: "tool_use", ID: id, Name: call.Name, Input: call.Input})
+				}
+				return content, "tool_use"
+			}
+		} else {
+			// Server-execution mode retains its strict whole-response parser;
+			// mixed prose is eligible only for declared client tools.
+			content := parseToolCalls(res.ToolText())
+			if len(content) == 1 && content[0].Type == "tool_use" {
+				return content, "tool_use"
+			}
+		}
 	}
 	return []ContentBlock{{Type: "text", Text: res.Text}}, "end_turn"
+}
+
+// Index 0 is the narration block started before the upstream turn. Each tool
+// gets its own subsequent block, with input supplied exactly once via deltas.
+func emitToolBlocks(emit func(string, map[string]any) bool, content []ContentBlock) {
+	index := 1
+	for _, block := range content {
+		if block.Type != "tool_use" {
+			continue
+		}
+		start := block
+		start.Input = json.RawMessage(`{}`)
+		if !emit("content_block_start", map[string]any{"index": index, "content_block": start}) {
+			return
+		}
+		if !emit("content_block_delta", map[string]any{"index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(block.Input)}}) {
+			return
+		}
+		if !emit("content_block_stop", map[string]any{"index": index}) {
+			return
+		}
+		index++
+	}
 }
 
 // SDK stream accumulators dispatch on the JSON type, not only the SSE event
