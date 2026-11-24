@@ -117,13 +117,19 @@ func (h *Handler) CountTokens(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error())
 		return
 	}
-	text, _, _, _, err := renderPrompt(&req)
+	text, _, _, atts, err := renderPrompt(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	bytes := len(text)
+	for _, att := range atts {
+		if strings.HasPrefix(att.MimeType, "text/") || att.MimeType == "application/json" {
+			bytes += len(att.Data)
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": len(text) / 4})
+	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": bytes / 4})
 }
 
 // ---------- endpoint ----------
@@ -689,30 +695,41 @@ func renderPrompt(req *MessagesRequest) (text string, tailAt, lastMsgAt int, att
 			}
 			continue
 		}
-		var blocks []ContentBlock
+		var blocks []json.RawMessage
 		if err := json.Unmarshal(m.Content, &blocks); err != nil {
 			return "", 0, 0, nil, fmt.Errorf("%s message: content must be a string or blocks", m.Role)
 		}
-		for _, bl := range blocks {
+		for _, rawBlock := range blocks {
+			var bl ContentBlock
+			if err := json.Unmarshal(rawBlock, &bl); err != nil {
+				return "", 0, 0, nil, fmt.Errorf("%s message block: %w", m.Role, err)
+			}
 			switch bl.Type {
 			case "text":
 				fmt.Fprintf(&b, "%s: %s\n\n", label, bl.Text)
-			case "image":
-				a, aerr := attachmentFromImageBlock(&bl)
+			case "image", "document":
+				var a *chat.Attachment
+				var aerr error
+				if bl.Type == "image" {
+					a, aerr = attachmentFromImageBlock(&bl)
+				} else {
+					a, aerr = attachmentFromDocumentBlock(&bl)
+				}
 				if aerr != nil {
-					return "", 0, 0, nil, fmt.Errorf("image block: %w", aerr)
+					return "", 0, 0, nil, fmt.Errorf("%s block: %w", bl.Type, aerr)
 				}
-				if a != nil {
-					atts = append(atts, *a)
+				if a == nil {
+					return "", 0, 0, nil, fmt.Errorf("missing %s attachment", bl.Type)
 				}
-			case "document":
-				a, aerr := attachmentFromDocumentBlock(&bl)
-				if aerr != nil {
-					return "", 0, 0, nil, fmt.Errorf("document block: %w", aerr)
+				digest := sha256.Sum256(rawBlock)
+				a.Name = fmt.Sprintf("input-%x.%s", digest[:8], extForMime(a.MimeType))
+				reference, refErr := attachmentReference(rawBlock, a.Name)
+				if refErr != nil {
+					return "", 0, 0, nil, refErr
 				}
-				if a != nil {
-					atts = append(atts, *a)
-				}
+				a.TranscriptOffset = b.Len() + 1
+				atts = append(atts, *a)
+				fmt.Fprintf(&b, "%s: %s\n\n", label, reference)
 			case "tool_use":
 				// Keep the correlation ID and escape embedded newlines. A tool
 				// transcript is data, not a new User/System instruction.
@@ -725,6 +742,9 @@ func renderPrompt(req *MessagesRequest) (text string, tailAt, lastMsgAt int, att
 				data, resultAtts, resultErr := renderToolResult(bl)
 				if resultErr != nil {
 					return "", 0, 0, nil, fmt.Errorf("tool_result: %w", resultErr)
+				}
+				for i := range resultAtts {
+					resultAtts[i].TranscriptOffset = b.Len() + 1
 				}
 				atts = append(atts, resultAtts...)
 				fmt.Fprintf(&b, "ToolResult: %s\n\n", data)
@@ -779,18 +799,28 @@ func renderToolResult(bl ContentBlock) ([]byte, []chat.Attachment, error) {
 			}
 			att.Name = fmt.Sprintf("tool-result-%x-%d.%s", digest[:8], i, extForMime(att.MimeType))
 			atts = append(atts, *att)
-			var reference map[string]json.RawMessage
-			if err := json.Unmarshal(raw, &reference); err != nil {
+			parts[i], err = attachmentReference(raw, att.Name)
+			if err != nil {
 				return nil, nil, err
 			}
-			delete(reference, "source")
-			reference["attachment"], _ = json.Marshal(att.Name)
-			parts[i], _ = json.Marshal(reference)
 		}
 		bl.Content, _ = json.Marshal(parts)
 	}
 	data, err := json.Marshal(ContentBlock{Type: "tool_result", ToolUseID: bl.ToolUseID, Content: bl.Content, IsError: bl.IsError})
 	return data, atts, err
+}
+
+func attachmentReference(raw json.RawMessage, name string) ([]byte, error) {
+	var reference map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &reference); err != nil {
+		return nil, err
+	}
+	if reference == nil {
+		return nil, errors.New("attachment block must be an object")
+	}
+	delete(reference, "source")
+	reference["attachment"], _ = json.Marshal(name)
+	return json.Marshal(reference)
 }
 
 // attachmentFromImageBlock converts an Anthropic `image` content block
@@ -847,7 +877,7 @@ func attachmentFromImageBlock(bl *ContentBlock) (*chat.Attachment, error) {
 }
 
 // attachmentFromDocumentBlock converts a `document` block (PDF/txt/etc,
-// base64 or URL) into a chat.Attachment.
+// base64, plain-text or URL source) into a chat.Attachment.
 func attachmentFromDocumentBlock(bl *ContentBlock) (*chat.Attachment, error) {
 	if len(bl.Source) == 0 {
 		return nil, errors.New("missing source")
@@ -866,11 +896,14 @@ func attachmentFromDocumentBlock(bl *ContentBlock) (*chat.Attachment, error) {
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
-	if t := extForMime(mime); t != "bin" {
-		name = "document." + t
-	}
 	var raw []byte
 	switch src.Type {
+	case "text":
+		if src.MediaType != "" && src.MediaType != "text/plain" {
+			return nil, errors.New("text document source requires text/plain")
+		}
+		mime = "text/plain"
+		raw = []byte(src.Data)
 	case "base64":
 		b, err := base64.StdEncoding.DecodeString(src.Data)
 		if err != nil {
@@ -888,6 +921,9 @@ func attachmentFromDocumentBlock(bl *ContentBlock) (*chat.Attachment, error) {
 		}
 	default:
 		return nil, fmt.Errorf("unsupported document source type %q", src.Type)
+	}
+	if t := extForMime(mime); t != "bin" {
+		name = "document." + t
 	}
 	return &chat.Attachment{Name: name, MimeType: mime, Data: raw}, nil
 }

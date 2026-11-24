@@ -286,7 +286,10 @@ func (cn *Conn) Send(ctx context.Context, sess *session.Session, opts TurnOpts) 
 	head := transcriptHead(opts)
 	send, commit := deltaTail(cn.sentTail, opts.Text, opts.Tail)
 	if send != opts.Text {
-		slog.Info("delta turn", "send_bytes", len(send), "tail_bytes", len(opts.Tail))
+		allAttachments := len(opts.Attachments)
+		opts.Attachments = deltaAttachments(opts.Text, send, opts.Attachments)
+		slog.Info("delta turn", "send_bytes", len(send), "tail_bytes", len(opts.Tail),
+			"attachments", allAttachments, "send_attachments", len(opts.Attachments))
 	}
 	opts.Text = send
 	res, err := cn.c.sendPrompt(ctx, cn.t, cn.convID, opts, sess)
@@ -325,6 +328,20 @@ func deltaTail(sentTail, text, tail string) (send, commit string) {
 		}
 	}
 	return text, tail
+}
+
+func deltaAttachments(text, send string, atts []Attachment) []Attachment {
+	if text == send || !strings.HasSuffix(text, send) {
+		return atts
+	}
+	start := len(text) - len(send)
+	var pending []Attachment
+	for _, att := range atts {
+		if att.TranscriptOffset == 0 || att.TranscriptOffset > start {
+			pending = append(pending, att)
+		}
+	}
+	return pending
 }
 
 // RunTurn performs one complete turn on a fresh WebSocket connection and

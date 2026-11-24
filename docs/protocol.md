@@ -211,6 +211,9 @@ quick2api mirrors that path:
 
 Prompt/context uploads use `text/plain`; client-provided image and document
 uploads retain their MIME type. Tool-result attachments use this same path.
+Anthropic attachment references carry their transcript position, so clean
+append-only continuation uploads only newly referenced attachments; reseeding a
+fresh upstream thread still uploads every attachment in that history.
 If a caller-provided attachment cannot be delivered, return an error rather
 than dropping it and asking the model to answer without the input. An explicit
 DLP denial, a malformed/non-successful policy check, or an unsettled check

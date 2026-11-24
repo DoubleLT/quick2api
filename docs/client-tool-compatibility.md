@@ -100,6 +100,31 @@ These are input-fidelity fixes. They do not establish that historical tool
 correlation loss caused Quick's natural-language refusal, or implement native
 Quick-to-Desktop tool registration.
 
+### An attachment-only message disappears from the history watermark
+
+Top-level Anthropic images/documents previously produced no transcript text,
+and all documents of a MIME type shared a filename. An attachment-only message
+therefore could leave the operative-message offset and append-only watermark
+unchanged; edits to its source were also invisible to history comparison.
+
+These blocks now render role-labelled JSON references with deterministic names
+and retain metadata such as document title/context. Attachment-only messages
+participate in operative-message selection. Nested tool-result attachments and
+top-level attachments carry their reference position into delta selection: an
+append-only turn uploads only newly referenced attachments. A fresh connection
+or divergent history still receives all attachments. Unbound attachments from
+other adapters keep their prior behavior.
+
+Document sources support the standard plain-text form (`type: text`,
+`media_type: text/plain`) at both top level and inside tool results. The local
+heuristic token estimate includes text/JSON attachment bytes; it remains an
+estimate, not model tokenization or image/PDF token accounting.
+
+Local regressions cover attachment-only messages, metadata and ordering,
+distinct/stable names, source edits, plain-text documents, UTF-8 delta offsets
+and preserving attachments when a conversation is reseeded. These input fixes
+do not establish a cause or remedy for Quick's natural-language tool refusal.
+
 ### Large histories lose the operative request or tool schema
 
 Oversized prompts use the existing attachment path. Trailing environment

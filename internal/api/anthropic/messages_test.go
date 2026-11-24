@@ -2,6 +2,8 @@ package anthropic
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -307,6 +309,74 @@ func TestNestedToolResultAttachmentsArePreserved(t *testing.T) {
 	invalid := req(t, `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"bad","content":{"text":"invalid shape"}}]}]}`)
 	if _, _, _, _, err := renderPrompt(invalid); err == nil {
 		t.Fatal("invalid result content silently disappeared")
+	}
+}
+
+func TestAttachmentOnlyMessageKeepsItsPlaceAndMetadata(t *testing.T) {
+	r := req(t, `{"system":"preamble","messages":[{"role":"user","content":"old request"},{"role":"assistant","content":"old reply"},{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"document","title":"latest document","context":"reference only","source":{"type":"text","media_type":"text/plain","data":"first\nsecond"}}]},{"role":"system","content":"environment"}]}`)
+	text, tailAt, finalAt, atts, err := renderPrompt(r)
+	if err != nil || len(atts) != 2 {
+		t.Fatalf("render attachments: %v %+v", err, atts)
+	}
+	if !strings.HasPrefix(text[tailAt:], "User: old request") || !strings.HasPrefix(text[finalAt:], "User: {") || strings.Contains(text[finalAt:], "old request") || !strings.HasSuffix(text[finalAt:], "System: environment") {
+		t.Fatalf("attachment-only operative turn was displaced: %s", text)
+	}
+	if strings.Contains(text, `"source"`) || strings.Contains(text, "base64") || !strings.Contains(text, `"title":"latest document"`) || !strings.Contains(text, `"context":"reference only"`) {
+		t.Fatalf("metadata lost or payload left inline: %s", text)
+	}
+	for _, att := range atts {
+		if att.TranscriptOffset <= finalAt || !strings.HasPrefix(text[att.TranscriptOffset-1:], "User: {") || !strings.Contains(text[att.TranscriptOffset-1:], att.Name) {
+			t.Fatalf("attachment has no transcript position: %+v", att)
+		}
+	}
+	if atts[0].Name == atts[1].Name || string(atts[1].Data) != "first\nsecond" || atts[1].MimeType != "text/plain" {
+		t.Fatalf("attachment identity/bytes lost: %+v", atts)
+	}
+	again, _, againFinal, againAtts, err := renderPrompt(r)
+	if err != nil || again != text || againFinal != finalAt || againAtts[1].Name != atts[1].Name || againAtts[1].TranscriptOffset != atts[1].TranscriptOffset {
+		t.Fatal("rendering an unchanged attachment history was unstable")
+	}
+}
+
+func TestAppendingOrEditingAttachmentsChangesTranscript(t *testing.T) {
+	r := req(t, `{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"first document"}}]}]}`)
+	first, _, _, firstAtts, err := renderPrompt(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Messages = append(r.Messages, Message{Role: "user", Content: json.RawMessage(`[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"second document"}}]`)})
+	next, _, finalAt, nextAtts, err := renderPrompt(r)
+	if err != nil || !strings.HasPrefix(next, first+"\n\n") || len(nextAtts) != 2 || nextAtts[0].Name == nextAtts[1].Name || nextAtts[0].Name != firstAtts[0].Name || finalAt <= len(first) {
+		t.Fatalf("appended document was invisible or collided: %s %+v %v", next, nextAtts, err)
+	}
+	r.Messages[0].Content = json.RawMessage(`[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"edited first document"}}]`)
+	edited, _, _, _, err := renderPrompt(r)
+	if err != nil || strings.HasPrefix(edited, first) {
+		t.Fatal("edited attachment looked like append-only history")
+	}
+}
+
+func TestPlainTextDocumentInToolResult(t *testing.T) {
+	r := req(t, `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"doc","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"实际工具输出\nline two"}}]}]}]}`)
+	text, _, finalAt, atts, err := renderPrompt(r)
+	if err != nil || len(atts) != 1 || string(atts[0].Data) != "实际工具输出\nline two" || atts[0].TranscriptOffset != finalAt+1 || !strings.Contains(text, atts[0].Name) {
+		t.Fatalf("plain-text tool result lost: %s %+v %v", text, atts, err)
+	}
+	bad := req(t, `{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"image/png","data":"not an image"}}]}]}`)
+	if _, _, _, _, err := renderPrompt(bad); err == nil {
+		t.Fatal("plain-text source was mislabeled as an image")
+	}
+}
+
+func TestCountTokensIncludesPlainTextAttachmentsWithoutBridge(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"` + strings.Repeat("a", 4000) + `"}}]}]}`
+	w := httptest.NewRecorder()
+	(&Handler{}).CountTokens(w, httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(body)))
+	var response struct {
+		InputTokens int `json:"input_tokens"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &response) != nil || response.InputTokens < 1000 {
+		t.Fatalf("counted a reference but omitted document text: %d %s", w.Code, w.Body.String())
 	}
 }
 

@@ -199,3 +199,26 @@ func TestAppendPromptSuffix(t *testing.T) {
 		t.Fatalf("second=%q commit=%q", second, commit)
 	}
 }
+
+func TestDeltaUploadsOnlyNewlyReferencedAttachments(t *testing.T) {
+	const head = "System: UTF-8 环境\n\n"
+	const previous = "User: old image reference"
+	const next = "User: new document reference"
+	full := head + previous + "\n\n" + next
+	send, _ := deltaTail(previous, full, previous+"\n\n"+next)
+	atts := []Attachment{
+		{Name: "old.png", TranscriptOffset: len(head) + 1},
+		{Name: "new.txt", TranscriptOffset: len(full) - len(next) + 1},
+		{Name: "unbound.bin"}, // other adapters/callers retain their behavior
+	}
+	newAtts := deltaAttachments(full, send, atts)
+	if send != next || len(newAtts) != 2 || newAtts[0].Name != "new.txt" || newAtts[1].Name != "unbound.bin" {
+		t.Fatalf("delta repeated old attachment or lost a new one: %s %+v", send, newAtts)
+	}
+	if len(deltaAttachments(full, full, atts)) != 3 || len(deltaAttachments(full, "unrelated", atts)) != 3 {
+		t.Fatal("a reseeded or unbound prompt lost its historical attachments")
+	}
+	if len(atts) != 3 || atts[0].Name != "old.png" {
+		t.Fatal("filter mutated the caller's full attachment list")
+	}
+}

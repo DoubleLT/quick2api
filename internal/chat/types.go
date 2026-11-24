@@ -111,6 +111,11 @@ type TurnOpts struct {
 type Attachment struct {
 	Name     string // filename shown to the model
 	MimeType string // e.g. "image/png"
+	// TranscriptOffset is the one-based byte offset of this attachment's
+	// reference in the full rendered Text. Zero means no transcript binding.
+	// A pooled delta need not upload attachments whose references were sent
+	// successfully on an earlier turn; a new connection still uploads all.
+	TranscriptOffset int
 	// Data is the raw bytes. Upload happens in sendPrompt — keep this under
 	// the ~20MB practical ceiling the attachment service accepts.
 	Data []byte
