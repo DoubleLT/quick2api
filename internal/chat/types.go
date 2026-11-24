@@ -107,6 +107,8 @@ type TurnOpts struct {
 	OnEvent func(TurnEvent)
 	// NativeRelay enables only the explicitly registered MCP relay on the
 	// proxy-owned outpost. It does not enable arbitrary local device execution.
+	// This local registration/courier name is not the model's callable name;
+	// Quick may expose the same relay with a device-qualified native identifier.
 	NativeRelay string
 	// NativeContinuation is supplied only after the native adapter validates a
 	// delivered, completed transcript checkpoint. The full Text remains available
@@ -115,6 +117,7 @@ type TurnOpts struct {
 	// OnNativeSession hands the adapter an idempotent discard callback for a
 	// completed socket whose final response could not be delivered downstream.
 	OnNativeSession func(discard func())
+	preparedContext *preparedContext
 }
 
 type NativeContinuation struct {

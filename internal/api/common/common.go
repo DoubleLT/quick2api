@@ -82,6 +82,25 @@ const (
 // user-facing text: UpstreamError.Message for typed frames, err.Error()
 // otherwise (it carries the "upstream: " prefix).
 func UpstreamError(err error) (status int, kind UpstreamKind, message string) {
+	// Setup retains its typed cause for classification, but its safe message
+	// must take precedence over arbitrary upstream bodies or close reasons.
+	var setup *chat.ConnectionSetupError
+	if errors.As(err, &setup) {
+		message = setup.Error()
+		var cause *chat.UpstreamError
+		if errors.As(setup, &cause) {
+			switch cause.Code {
+			case "unauthenticated", "token_expired":
+				return http.StatusUnauthorized, KindUnauthenticated, message
+			case "rate_limited", "throttled":
+				return http.StatusTooManyRequests, KindRateLimited, message
+			}
+		}
+		if errors.Is(setup, context.DeadlineExceeded) {
+			return http.StatusGatewayTimeout, KindTimeout, message
+		}
+		return http.StatusBadGateway, KindUpstream, message
+	}
 	var policy *chat.AttachmentPolicyError
 	if errors.As(err, &policy) && policy.Blocked {
 		return http.StatusForbidden, KindPermissionDenied, policy.Message

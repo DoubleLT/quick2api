@@ -144,9 +144,11 @@ func TestNativeInvokePreservesApplicationErrorsAndNeverRetries(t *testing.T) {
 			} else if out.err == nil || len(out.result) != 0 {
 				t.Fatal("invalid courier response accepted")
 			}
-			call.Name = "shell"
-			if out := runtime.invoke(context.Background(), call); out.err == nil {
-				t.Fatal("non-relay device tool enabled")
+			for _, unapproved := range []string{"shell", "DEVICE_A_" + relayTestName, "DEVICE_B_" + relayTestName, "other_server__quick2api_client_call", relayTestName + "_extra"} {
+				call.Name = unapproved
+				if out := runtime.invoke(context.Background(), call); out.err == nil {
+					t.Fatal("unapproved device/callable name entered the local courier", unapproved)
+				}
 			}
 			if calls.Load() != 1 {
 				t.Fatal("native courier retried or executed an unapproved device tool")

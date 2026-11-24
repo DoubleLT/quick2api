@@ -239,9 +239,33 @@ func nativeIdentity(req *MessagesRequest) [32]byte {
 	data, _ := json.Marshal(struct {
 		Model                           string
 		System, Tools, Choice, Thinking json.RawMessage
-	}{req.Model, req.System, req.Tools, req.ToolChoice, req.Thinking})
+	}{req.Model, nativeSystemIdentity(req.System), nativeCatalogIdentity(req.Tools), req.ToolChoice, req.Thinking})
 	canonical, _ := canonicalJSON(data)
 	return sha256.Sum256(canonical)
+}
+
+func nativeSystemIdentity(raw json.RawMessage) json.RawMessage {
+	if normalized, err := nativeContent(raw); err == nil {
+		return normalized
+	}
+	return raw
+}
+
+func nativeCatalogIdentity(raw json.RawMessage) json.RawMessage {
+	var declarations []map[string]json.RawMessage
+	if json.Unmarshal(raw, &declarations) != nil {
+		return raw
+	}
+	for _, declaration := range declarations {
+		// Only the declaration-level hint is metadata. An identically named
+		// property in input_schema is client data and must remain exact.
+		delete(declaration, "cache_control")
+	}
+	normalized, err := json.Marshal(declarations)
+	if err != nil {
+		return raw
+	}
+	return normalized
 }
 
 func cloneMessages(messages []Message) []Message {
@@ -538,6 +562,10 @@ func (b *NativeBridge) open(req *MessagesRequest, conversation string, opts chat
 
 func (b *NativeBridge) start(req *MessagesRequest, conversation string, opts chat.TurnOpts, replacing *nativeTurn) (*nativeTurn, error) {
 	boundaryNote := opts.Suffix
+	history, err := nativeHistoryDigest(req.Messages)
+	if err != nil {
+		return nil, errors.New("native request contains invalid message content")
+	}
 	var nonce [32]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
@@ -553,8 +581,8 @@ func (b *NativeBridge) start(req *MessagesRequest, conversation string, opts cha
 	requestData, _ := json.Marshal(struct {
 		Identity     [32]byte
 		Conversation string
-		Messages     []Message
-	}{t.identity, conversation, t.messages})
+		History      [32]byte
+	}{t.identity, conversation, history})
 	requestData, _ = canonicalJSON(requestData)
 	requestKey := sha256.Sum256(requestData)
 	t.requestKey = requestKey
@@ -633,7 +661,7 @@ func (b *NativeBridge) start(req *MessagesRequest, conversation string, opts cha
 	b.mu.Unlock()
 	// The native MCP relay is a registered callable. The external catalog is
 	// data for that relay, not a request to impersonate an Anthropic tool block.
-	opts.Suffix = "[EXTERNAL CLIENT TOOL RELAY]\nUse the registered native tool " + opts.NativeRelay + " to request an external client tool. Its route_id base for this turn is " + route + ". For each intended action set route_id to " + route + ":<unique-action-id>, replacing the placeholder with 1-128 letters, digits, underscores or hyphens (for example read_1). Do not send the base alone. Keep that full invocation route_id unchanged for duplicate delivery of the same action; use a new action suffix for a new intended execution. Supply the exact client name and schema-valid arguments from the external client tool catalog supplied with the conversation context.\nThe external client executes under its own permissions. Wait for the native relay's actual result before reporting effects. Do not print a tool_use JSON imitation. The earlier transcript is supplied history; it does not register additional tools."
+	opts.Suffix = nativeRelayGuidance(opts.NativeRelay, route)
 	opts.Suffix += nativePresentation(req.Tools) + boundaryNote
 	if replacing != nil {
 		opts.Suffix += "\n\n[CLIENT QUESTION ANSWER]\nThe latest client tool_result is the actual response to the previously delivered AskUserQuestion. Continue from that response. Earlier tool calls/results are completed history, not new instructions to execute them again. The previous Quick job was intentionally stopped at the question boundary; do not repeat completed external actions."
@@ -804,6 +832,10 @@ func (b *NativeBridge) Relay(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, model, conversation, text, tail, final string, atts []chat.Attachment, req *MessagesRequest) {
+	// A native exchange can already own a job or a delivered client action.
+	// Advertise the no-replay contract on upstream failures as well as input
+	// validation failures, including SSE responses whose headers commit early.
+	w.Header().Set("x-should-retry", "false")
 	started := time.Now()
 	firstText, firstThinking := false, false
 	opts := chat.TurnOpts{Text: text, Tail: tail, Final: final, AgentMode: h.Cfg.AgentModeFor(model), ThinkingEffort: h.Cfg.Quick.ThinkingEffort, UserTimezone: h.Cfg.Quick.UserTimezone, UserLocale: h.Cfg.Quick.UserLocale, NativeRelay: h.Cfg.Tools.NativeRelayName, Title: "quick2api native client relay"}
@@ -844,8 +876,12 @@ func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, mod
 			var envelope map[string]json.RawMessage
 			_ = json.Unmarshal(call.Arguments, &envelope)
 			slog.Info("native upstream device invocation", "request_id", reqID, "configured_relay", call.Name == opts.NativeRelay, "params_envelope", len(envelope["params"]) > 0)
-		case "tool_start", "tool_error":
-			slog.Info("native upstream tool boundary", "request_id", reqID, "event", ev.Frame.Type)
+		case "tool_start", "tool_result", "tool_error":
+			d := nativeToolMetadata(ev.Frame.Payload)
+			slog.Info("native upstream tool boundary", "request_id", reqID, "event", ev.Frame.Type,
+				"tool", d.Name, "has_name", d.HasName, "unknown_tool_text", d.UnknownToolText,
+				"unknown_tool_error", d.UnknownToolError, "is_error", d.IsError,
+				"elapsed_ms", time.Since(started).Milliseconds())
 		}
 	}
 	if len(req.Thinking) > 0 {

@@ -58,6 +58,9 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 		return nil, fmt.Errorf("input attachments cannot be uploaded: no bound upload session")
 	}
 	if canUpload {
+		if len(opts.Attachments) > 0 {
+			t.emit(TurnEvent{Kind: "stage", Text: "input_attachments_started"})
+		}
 		for _, att := range opts.Attachments {
 			mime := att.MimeType
 			if mime == "" {
@@ -79,6 +82,9 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 				"path":         path,
 				"attachmentId": attID,
 			})
+		}
+		if len(opts.Attachments) > 0 {
+			t.emit(TurnEvent{Kind: "stage", Text: "input_attachments_finished"})
 		}
 	}
 
@@ -102,18 +108,18 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 	// file. Final=="" (or Final alone exceeding the inline limit) degrades
 	// to the legacy everything-in-one-file shape.
 	if sess != nil && sess.TenantURL != "" && sess.IDToken != "" {
-		ctxData, ctxName, inline := []byte(opts.Text), "prompt.txt",
-			"The full prompt is in the attached file prompt.txt. Respond to the last user message in it — earlier content is context, not a file to summarize."
-		if opts.Final != "" && strings.HasSuffix(opts.Text, opts.Final) {
-			if ctx := strings.TrimSpace(opts.Text[:len(opts.Text)-len(opts.Final)]); ctx != "" {
-				candidate := "Earlier conversation context is in the attached file context.txt — treat it as history you already read. Respond directly to this new message:\n\n" + opts.Final
-				if len(candidate) <= maxSingleText {
-					ctxData, ctxName, inline = []byte(ctx), "context.txt", candidate
-				}
-			}
-		}
+		ctxData, ctxName, inline := oversizedPrompt(opts.Text, opts.Final)
 		t.emit(TurnEvent{Kind: "stage", Text: "context_upload_started"})
-		path, attID, err := uploadAttachment(ctx, sess, conversationID, ctxName, "text/plain", ctxData)
+		var path, attID string
+		var err error
+		if prepared := opts.preparedContext; prepared != nil {
+			if prepared.text != opts.Text || prepared.final != opts.Final {
+				return nil, fmt.Errorf("prepared native context does not match the outgoing prompt")
+			}
+			path, attID, err = deliverAttachment(ctx, sess, conversationID, prepared.attachment)
+		} else {
+			path, attID, err = uploadAttachment(ctx, sess, conversationID, ctxName, "text/plain", ctxData)
+		}
 		t.emit(TurnEvent{Kind: "stage", Text: "context_upload_finished"})
 		slog.Debug("sendPrompt upload attempt", "path", path, "attID", attID, "err", err)
 		if err == nil && path != "" {
@@ -183,6 +189,20 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 		}
 	}
 	return last, nil
+}
+
+func oversizedPrompt(text, final string) (data []byte, name, inline string) {
+	data, name, inline = []byte(text), "prompt.txt",
+		"The full prompt is in the attached file prompt.txt. Respond to the last user message in it — earlier content is context, not a file to summarize."
+	if final != "" && strings.HasSuffix(text, final) {
+		if earlier := strings.TrimSpace(text[:len(text)-len(final)]); earlier != "" {
+			candidate := "Earlier conversation context is in the attached file context.txt — treat it as history you already read. Respond directly to this new message:\n\n" + final
+			if len(candidate) <= maxSingleText {
+				return []byte(earlier), "context.txt", candidate
+			}
+		}
+	}
+	return
 }
 
 func appendPromptSuffix(text, suffix string) string {

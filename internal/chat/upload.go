@@ -36,8 +36,23 @@ import (
 // The returned serverPath goes onto user_message payload.attachments[].path;
 // the model reads the file server-side in one turn.
 func uploadAttachment(ctx context.Context, sess *session.Session, convID, name, mime string, data []byte) (string, string, error) {
+	prepared, err := prepareAttachment(ctx, sess, name, mime, data)
+	if err != nil {
+		return "", "", err
+	}
+	return deliverAttachment(ctx, sess, convID, prepared)
+}
+
+// Raw upload and policy approval do not depend on a conversation. Binding the
+// approved attachment does, and must wait for session_create to complete.
+type preparedAttachment struct {
+	path string
+	id   string
+}
+
+func prepareAttachment(ctx context.Context, sess *session.Session, name, mime string, data []byte) (preparedAttachment, error) {
 	if sess == nil || sess.IDToken == "" || sess.TenantURL == "" {
-		return "", "", fmt.Errorf("upload: no session bound")
+		return preparedAttachment{}, fmt.Errorf("upload: no session bound")
 	}
 	auth := "Bearer " + sess.IDToken
 	httpc := &http.Client{Timeout: 30 * time.Second}
@@ -53,47 +68,49 @@ func uploadAttachment(ctx context.Context, sess *session.Session, convID, name, 
 			"&contentLength="+fmt.Sprint(len(data)),
 		bytes.NewReader(data))
 	if err != nil {
-		return "", "", err
+		return preparedAttachment{}, err
 	}
 	up.Header.Set("Authorization", auth)
 	up.Header.Set("Content-Type", "application/octet-stream")
 	up.Header.Set("Origin", "https://quick.aws.com")
 	upResp, err := httpc.Do(up)
 	if err != nil {
-		return "", "", fmt.Errorf("upload: %w", err)
+		return preparedAttachment{}, fmt.Errorf("upload: %w", err)
 	}
 	upBody, _ := io.ReadAll(io.LimitReader(upResp.Body, 1<<20))
 	upResp.Body.Close()
 	slog.Debug("upload-attachment", "status", upResp.StatusCode, "body", trunc(string(upBody), 400))
 	if upResp.StatusCode >= 400 {
-		return "", "", fmt.Errorf("upload-attachment %d: %s", upResp.StatusCode, trunc(string(upBody), 200))
+		return preparedAttachment{}, fmt.Errorf("upload-attachment %d: %s", upResp.StatusCode, trunc(string(upBody), 200))
 	}
 	var upOut struct {
 		AttachmentID string `json:"attachmentId"`
 		Path         string `json:"path"`
 	}
 	if err := json.Unmarshal(upBody, &upOut); err != nil {
-		return "", "", fmt.Errorf("upload-attachment decode: %w", err)
+		return preparedAttachment{}, fmt.Errorf("upload-attachment decode: %w", err)
 	}
 	if upOut.AttachmentID == "" {
 		if upOut.Path != "" {
-			return upOut.Path, "", nil
+			return preparedAttachment{path: upOut.Path}, nil
 		}
-		return "", "", fmt.Errorf("upload-attachment returned no attachmentId: %s", trunc(string(upBody), 200))
+		return preparedAttachment{}, fmt.Errorf("upload-attachment returned no attachmentId: %s", trunc(string(upBody), 200))
 	}
 	attID := upOut.AttachmentID
 
 	// 2. DLP poll — wait for policyAction=ALLOW (or a skip status).
-	for i := 0; i < 20; i++ {
-		select {
-		case <-ctx.Done():
-			return "", "", ctx.Err()
-		case <-time.After(400 * time.Millisecond):
+	for i := 0; i <= 20; i++ {
+		// Check immediately once: already-approved attachments need no fixed
+		// sleep. Pending checks retain the existing twenty delayed polls.
+		if i > 0 {
+			if err := waitContext(ctx, 400*time.Millisecond); err != nil {
+				return preparedAttachment{}, err
+			}
 		}
 		d, err := http.NewRequestWithContext(ctx, "GET",
 			sess.TenantURL+"/integration/quick-work/attachment-dlp-status?attachmentId="+url.QueryEscape(attID), nil)
 		if err != nil {
-			return "", "", err
+			return preparedAttachment{}, err
 		}
 		d.Header.Set("Authorization", auth)
 		d.Header.Set("Origin", "https://quick.aws.com")
@@ -106,26 +123,33 @@ func uploadAttachment(ctx context.Context, sess *session.Session, convID, name, 
 		dResp.Body.Close()
 		slog.Debug("dlp-status", "attempt", i+1, "status", dResp.StatusCode, "body", trunc(string(dBody), 400))
 		if dResp.StatusCode/100 != 2 {
-			return "", "", &AttachmentPolicyError{Message: fmt.Sprintf("attachment policy check returned HTTP %d", dResp.StatusCode)}
+			return preparedAttachment{}, &AttachmentPolicyError{Message: fmt.Sprintf("attachment policy check returned HTTP %d", dResp.StatusCode)}
 		}
 		var dOut struct {
 			DLPJobStatus string `json:"dlpJobStatus"`
 			PolicyAction string `json:"policyAction"`
 		}
 		if err := json.Unmarshal(dBody, &dOut); err != nil {
-			return "", "", &AttachmentPolicyError{Message: "attachment policy check returned invalid JSON"}
+			return preparedAttachment{}, &AttachmentPolicyError{Message: "attachment policy check returned invalid JSON"}
 		}
 		cleared, policyErr := attachmentPolicyDecision(dOut.PolicyAction, dOut.DLPJobStatus)
 		if policyErr != nil {
-			return "", "", policyErr
+			return preparedAttachment{}, policyErr
 		}
 		if cleared {
-			goto deliver
+			return preparedAttachment{id: attID}, nil
 		}
 	}
-	return "", "", &AttachmentPolicyError{Message: "attachment policy check did not settle in time"}
+	return preparedAttachment{}, &AttachmentPolicyError{Message: "attachment policy check did not settle in time"}
+}
 
-deliver:
+func deliverAttachment(ctx context.Context, sess *session.Session, convID string, prepared preparedAttachment) (string, string, error) {
+	if prepared.path != "" {
+		return prepared.path, prepared.id, nil
+	}
+	attID := prepared.id
+	auth := "Bearer " + sess.IDToken
+	httpc := &http.Client{Timeout: 30 * time.Second}
 	// 3. Deliver: bind attachmentId to the conversation, returns serverPath.
 	// Renderer lZn() → ll("/files/upload/<sid>", {attachmentId}) → flat
 	// qbs-event invokeAgent.

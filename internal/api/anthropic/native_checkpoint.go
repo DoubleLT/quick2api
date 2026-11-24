@@ -21,23 +21,36 @@ type nativeCheckpoint struct {
 }
 
 func nativeHistoryDigest(messages []Message) ([32]byte, error) {
-	copy := append([]Message(nil), messages...)
-	for i := range copy {
-		content, err := nativeContent(copy[i].Content)
+	// Hash the same canonical JSON array incrementally. A large history no
+	// longer needs a second full JSON buffer and decoded object tree at once.
+	if len(messages) == 0 {
+		return sha256.Sum256([]byte("null")), nil
+	}
+	h := sha256.New()
+	h.Write([]byte("["))
+	for i, message := range messages {
+		content, err := nativeContent(message.Content)
 		if err != nil {
 			return [32]byte{}, err
 		}
-		copy[i].Content = content
+		message.Content = content
+		data, err := json.Marshal(message)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		data, err = canonicalJSON(data)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		if i > 0 {
+			h.Write([]byte(","))
+		}
+		h.Write(data)
 	}
-	data, err := json.Marshal(copy)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	data, err = canonicalJSON(data)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	return sha256.Sum256(data), nil
+	h.Write([]byte("]"))
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
 }
 
 func (c nativeCheckpoint) continuation(req *MessagesRequest, identity [32]byte) *chat.NativeContinuation {

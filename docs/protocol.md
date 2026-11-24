@@ -135,6 +135,42 @@ Two things that bite if skipped:
 ← keepalive                                 (idle heartbeats, ignore)
 ```
 
+Local handshake failure handling (corrected after live 2026-11-24 regressions):
+the compatibility setting may tolerate only a missing acknowledgement deadline.
+Socket closure (including observed 1011 during `session_connect`), explicit
+error frames and caller cancellation make the handshake return failure instead
+of advancing. The handshake itself does not retry, and native jobs do not
+retry; the existing compatibility bridge's reconnect policy is separate.
+Queued fatal input at the deadline must not be hidden by
+timer selection. Tolerated timeouts emit `session_connected_unconfirmed` or
+`session_created_unconfirmed`, not a confirmed acknowledgement. This is a local
+error-handling rule; it does not establish the server-side cause of a 1011.
+
+A separate handshake-only live diagnostic on 2026-11-24 sent zero
+`user_message` frames, uploaded no history and invoked no tools. Six serial
+connections succeeded; of six connections opened in pairs, two closed with
+1011 before the first acknowledgement. This reproduces a transport failure
+without any model prompt. With setup serialized, the same twelve-connection
+matrix passed. It supports concurrent setup as a contributing condition, not
+the sole cause of every 1011 or an explanation for content filtering.
+
+Cold connections now acquire a process-wide gate keyed by host, tenant,
+actor, account and registered device. Tokens are excluded so refresh cannot
+bypass the gate. Ownership covers dial, connect/create and settle, and ends
+before sending a user message. Existing conversations can infer concurrently;
+oversized-context preparation can still overlap setup. Queue waits are
+cancellable; all setup failures release ownership. Metadata stages
+`connection_queued` / `connection_acquired` expose waiting separately from
+network setup. This coordinates only this proxy process, not other proxies or
+the official Quick application. A queued cold connection takes longer by design.
+
+`ConnectionSetupError` retains its cause for classification while reporting
+only the failed stage, close code if available, and that no user message was
+sent on that connection. It does not expose dial URLs, response bodies or
+arbitrary close reasons. Native HTTP and SSE responses advertise
+`x-should-retry: false`; clients that honor it must not replay a failed job.
+This header is advisory and does not control every SDK or intermediary.
+
 Also possible mid-turn: `tool_start` / `tool_arguments` / `tool_progress` /
 `tool_result` / `tool_error` (the agent runs its own tools upstream; use their
 boundaries to separate text spans, not as client tool calls), `error` `{code,message}`,

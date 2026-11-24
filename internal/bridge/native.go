@@ -30,7 +30,11 @@ func (b *Bridge) sendNative(ctx context.Context, sess *session.Session, opts cha
 	}
 	b.mu.Unlock()
 	if e == nil {
-		cn, err := b.ChatClient().NewConversation(ctx, sess, "")
+		// The public conversation key is never an upstream UUID on a cold turn.
+		initial := opts
+		initial.ConversationID = ""
+		initial.Tail = ""
+		cn, err := b.ChatClient().NewNativeConversation(ctx, sess, initial)
 		if err != nil {
 			return nil, err
 		}
