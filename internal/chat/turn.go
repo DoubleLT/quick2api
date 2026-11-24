@@ -33,11 +33,13 @@ const handshakeGap = 400 * time.Millisecond
 // (prompt.go) and the collector below all take *turn instead of passing
 // the send/collect/inCh/emit closures around separately.
 type turn struct {
-	ws   *websocket.Conn
-	in   chan inbound
-	emit func(TurnEvent)
-	done chan struct{}
-	once sync.Once
+	ws      *websocket.Conn
+	in      chan inbound
+	emit    func(TurnEvent)
+	done    chan struct{}
+	once    sync.Once
+	writeMu sync.Mutex
+	native  *nativeRuntime
 }
 
 func (t *turn) close() {
@@ -391,10 +393,28 @@ func (t *turn) waitFor(ctx context.Context, d time.Duration, want func(*Frame) b
 // close; shared by the single-turn and chunked paths in prompt.go.
 func (t *turn) collect(ctx context.Context, res *TurnResult) (*TurnResult, error) {
 	var textSeen atomic.Bool
+	nativeCtx, stopNative := context.WithCancel(ctx)
+	var nativeCalls sync.WaitGroup
+	defer func() { stopNative(); nativeCalls.Wait() }()
+	var nativeDone <-chan nativeReply
+	var replies chan nativeReply
+	seenNative := make(map[string]bool)
+	activeNative := 0
+	if t.native != nil {
+		replies = make(chan nativeReply, 32)
+		nativeDone = replies
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case reply := <-nativeDone:
+			activeNative--
+			if err := t.send(map[string]any{"type": "tool_result", "payload": map[string]any{
+				"tool_call_id": reply.id, "result": reply.result, "error": reply.err,
+			}}); err != nil {
+				return nil, &UpstreamError{Code: "native_relay_disconnected", Message: "native tool result delivery failed; execution state is uncertain"}
+			}
 		case in, ok := <-t.in:
 			if !ok || in.err != nil {
 				if textSeen.Load() {
@@ -410,6 +430,29 @@ func (t *turn) collect(ctx context.Context, res *TurnResult) (*TurnResult, error
 			f := in.f
 			t.emit(TurnEvent{Kind: "frame", Frame: f})
 			switch f.Type {
+			case "tool_call":
+				if t.native == nil {
+					continue
+				}
+				var call NativeCall
+				if json.Unmarshal(f.Payload, &call) != nil || call.ID == "" || call.Name == "" || !json.Valid(call.Arguments) {
+					return nil, &UpstreamError{Code: "invalid_native_call", Message: "malformed native tool call"}
+				}
+				if seenNative[call.ID] || len(seenNative) >= 512 || activeNative >= 32 {
+					return nil, &UpstreamError{Code: "invalid_native_call", Message: "duplicate native call id or native call limit exceeded"}
+				}
+				seenNative[call.ID] = true
+				activeNative++
+				res.ToolTextOffset = len(res.Text)
+				nativeCalls.Add(1)
+				go func() {
+					defer nativeCalls.Done()
+					reply := t.native.invoke(nativeCtx, call)
+					select {
+					case replies <- reply:
+					case <-nativeCtx.Done():
+					}
+				}()
 			case "tool_start", "tool_result", "tool_error":
 				// Native Quick tools (such as reading context.txt) separate
 				// progress narration from the subsequent client-tool reply.
@@ -480,6 +523,9 @@ func (t *turn) collect(ctx context.Context, res *TurnResult) (*TurnResult, error
 				}
 				return nil, &UpstreamError{Code: p.Code, Message: msg}
 			case "message_complete":
+				if activeNative != 0 {
+					return nil, &UpstreamError{Code: "incomplete_native_turn", Message: "upstream completed while native tool calls were pending"}
+				}
 				t.emit(TurnEvent{Kind: "done"})
 				return res, nil
 			case "session_end", "session_ended":

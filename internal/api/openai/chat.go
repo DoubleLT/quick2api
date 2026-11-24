@@ -128,8 +128,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ChatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error(), "")
+	if err := common.DecodeRequestBody(w, r, &req, h.Cfg.RequestBodyLimit()); err != nil {
+		status, kind, message := common.RequestBodyError(err)
+		writeError(w, status, kind, message, "")
 		return
 	}
 	if len(req.Messages) == 0 {

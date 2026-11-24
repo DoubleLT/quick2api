@@ -10,6 +10,30 @@ const sessionTool = `[{"name":"mcp__ccd_session_mgmt__list_sessions","input_sche
 const sessionCall = `{"type":"tool_use","id":"toolu_ls01","name":"mcp__ccd_session_mgmt__list_sessions","input":{"limit":10}}`
 const sessionNarration = "Need to find the shell session's local id."
 
+func TestClientToolTypedCallsEnforceWireShape(t *testing.T) {
+	// A permissive schema must not loosen the transport's object-only contract.
+	catalog := NewClientTools(json.RawMessage(`[{"name":"Read","input_schema":{}}]`), nil)
+	for _, test := range []struct{ name, kind, input string }{
+		{"missing type", "", `{}`},
+		{"text block", "text", `{}`},
+		{"null", "tool_use", `null`},
+		{"array", "tool_use", `[]`},
+		{"scalar", "tool_use", `"path"`},
+		{"duplicate key", "tool_use", `{"path":"a","path":"b"}`},
+		{"nested duplicate", "tool_use", `{"options":{"path":"a","path":"b"}}`},
+		{"trailing data", "tool_use", `{} {}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := catalog.ValidateCalls([]ToolCallJSON{{Type: test.kind, Name: "Read", Input: json.RawMessage(test.input)}}); err == nil {
+				t.Fatal("invalid typed tool call accepted")
+			}
+		})
+	}
+	if err := catalog.ValidateCalls([]ToolCallJSON{{Type: "tool_use", Name: "Read", Input: json.RawMessage(`{"offset":9007199254740993}`)}}); err != nil {
+		t.Fatalf("valid typed object rejected: %v", err)
+	}
+}
+
 func TestClientToolReplyObservedDesktopFormat(t *testing.T) {
 	catalog := NewClientTools(json.RawMessage(sessionTool), nil)
 	for _, text := range []string{sessionCall, "```json\n" + sessionCall + "\n```", sessionNarration + "\n\n" + sessionCall, sessionNarration + "\r\n\r\n" + sessionCall} {

@@ -165,7 +165,7 @@ func (p *Pool) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResul
 		return nil, fmt.Errorf("no live lanes (all cooled): %v", last)
 	}
 	res, err := l.Bridge.RunTurn(ctx, opts)
-	if err != nil && coolable(err) {
+	if err != nil && coolable(err) && opts.NativeRelay == "" {
 		l.cool(err)
 		// One retry on another lane — the request shouldn't die just
 		// because the first pick went stale.

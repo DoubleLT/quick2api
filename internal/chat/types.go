@@ -105,6 +105,9 @@ type TurnOpts struct {
 	// OnEvent is invoked synchronously from the read loop; implementations
 	// should be fast or hand off to a channel.
 	OnEvent func(TurnEvent)
+	// NativeRelay enables only the explicitly registered MCP relay on the
+	// proxy-owned outpost. It does not enable arbitrary local device execution.
+	NativeRelay string
 }
 
 // Attachment is one multimodal input part to ship out-of-band.

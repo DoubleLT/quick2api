@@ -31,6 +31,17 @@ const maxSingleText = 55_000
 // re-inference. If the attachment path fails it falls back to sequential
 // user_message turns with context-priming prefixes.
 func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string, opts TurnOpts, sess *session.Session) (*TurnResult, error) {
+	if opts.NativeRelay != "" {
+		runtime, err := prepareNativeRuntime(ctx, sess, opts.NativeRelay)
+		if err != nil {
+			return nil, err
+		}
+		t.native = runtime
+		defer runtime.client.CloseIdleConnections()
+		runtime.deviceFields["surfaceType"] = c.SurfaceType
+		runtime.deviceFields["appVersion"] = orElse(c.AppVersion, "1.2.4660")
+		defer func() { t.native = nil }()
+	}
 	opts.Text = appendPromptSuffix(opts.Text, opts.Suffix)
 	if opts.Final != "" {
 		opts.Final = appendPromptSuffix(opts.Final, opts.Suffix)
@@ -122,13 +133,22 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 				slog.Debug("attachment path succeeded", "path", path)
 				return res, nil
 			}
+			if opts.NativeRelay != "" {
+				return nil, &UpstreamError{Code: "native_context_delivery_failed", Message: "native turn returned an empty answer; it will not be replayed through chunk fallback"}
+			}
 			slog.Warn("attachment path returned empty/failed; falling back to chunks", "err", err)
 		} else if err != nil {
+			if opts.NativeRelay != "" {
+				return nil, err
+			}
 			if !uploadFallbackAllowed(err) {
 				return nil, err
 			}
 			slog.Warn("attachment upload failed; falling back to chunks", "error", err)
 		}
+	}
+	if opts.NativeRelay != "" {
+		return nil, &UpstreamError{Code: "native_context_delivery_failed", Message: "native transport requires intact context delivery; chunk fallback is disabled"}
 	}
 
 	// Fallback: sequential user_message turns with context-priming prefixes.
@@ -179,6 +199,11 @@ func appendPromptSuffix(text, suffix string) string {
 func sendUserMessage(t *turn, conversationID, text string, opts TurnOpts, attachments []map[string]any) error {
 	payload := map[string]any{"thread_id": conversationID, "text": text, "message_id": newUUID()}
 	fillMsgOpts(payload, opts)
+	if t.native != nil {
+		for key, value := range t.native.deviceFields {
+			payload[key] = value
+		}
+	}
 	if len(attachments) > 0 {
 		payload["attachments"] = attachments
 	}

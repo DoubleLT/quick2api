@@ -72,11 +72,12 @@ func New(ctx context.Context, cfg *config.Config) (*Bridge, error) {
 		slog.Info("session source: attached outpost", "url", o.URL, "ws_host", s.WSHost)
 	default:
 		o, err := session.Spawn(done, session.SpawnOpts{
-			AgentPath:  cfg.Quick.AgentPath,
-			Manifest:   cfg.Quick.Manifest,
-			BuildStage: cfg.Quick.BuildStage,
-			Port:       cfg.Quick.OutpostPort,
-			WorkDir:    "",
+			AgentPath:   cfg.Quick.AgentPath,
+			Manifest:    cfg.Quick.Manifest,
+			BuildStage:  cfg.Quick.BuildStage,
+			ProfileRoot: cfg.Quick.ProfileRoot,
+			Port:        cfg.Quick.OutpostPort,
+			WorkDir:     "",
 		})
 		if err != nil {
 			return nil, err
@@ -222,6 +223,13 @@ func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnRes
 	if err != nil {
 		b.noteErr(err)
 		return nil, err
+	}
+	if opts.NativeRelay != "" {
+		// A native exchange owns this socket until completion, including all
+		// client-result waits. It is never pooled, swept, replayed or moved to
+		// a different lane after a tool may have been executed.
+		opts.ConversationID = ""
+		return b.ChatClient().RunTurn(ctx, sess, opts)
 	}
 
 	// Session reuse: keep one live conversation per client ConversationID.

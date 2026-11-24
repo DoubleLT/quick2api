@@ -141,6 +141,51 @@ boundaries to separate text spans, not as client tool calls), `error` `{code,mes
 `guardrail_blocked`, `session_end`, `session_title_updated`, various
 `*_sync` housekeeping frames.
 
+### Registered MCP relay and duplicate device delivery (2026-11-24)
+
+An independently spawned outpost loaded the user's UI-approved MCP registration
+only with the selected account profile passed as `QUICKWORK_ROOT`. Its
+`GET /local/mcp/list` returned an enabled, connected server and tool
+`quick2api_client_relay__quick2api_client_call` with the relay routing schema.
+`/local/list_tools` still listed only the built-in tools and the outpost ID.
+Do not infer MCP availability or synthesize an `mcp__` prefix from that catalog.
+
+Observed native WebSocket device frame:
+
+```json
+{"type":"tool_call","payload":{"tool_call_id":"<id>",
+ "tool_name":"quick2api_client_relay__quick2api_client_call",
+ "arguments":{"params":{"route_id":"<turn-token>:read_1",
+ "name":"Read","arguments":{"file_path":"<approved-fixture>"}}}}}
+```
+
+Courier to the proxy-owned outpost uses `POST /local/invoke_tool`, bearer
+authentication, and `{tool_name, arguments, wire_paths:true, tool_call_id,
+request_timeout_ms}`. Preserve `arguments` including its `params` envelope.
+A diagnostic that passed the relay's raw arguments instead caused the outpost
+to unwrap the client's nested `arguments` and the MCP server rejected it.
+The response is returned unchanged in
+`{type:"tool_result",payload:{tool_call_id,result:<outpost JSON>,error:null}}`.
+An HTTP 200 can still contain an actual `isError:true` tool failure.
+
+The same invocation was also observed arriving directly through MCP before
+its WebSocket courier delivery. Without invocation receipts this produced two
+external client tool requests from one upstream job. The relay now binds a
+per-action suffix in `route_id` to one name, canonical input and actual result.
+The real isolated acceptance run had two MCP callbacks, one actual fixture Read,
+one upstream RunTurn/socket and the correct final first line. This establishes
+that tested path only; it is not proof that all old Desktop sessions recover.
+
+An actual Claude Code client then exposed two continuation representation
+differences: an earlier message's content changed from a string into a text
+block array, and its echoed assistant tool block carried cache metadata. Raw
+JSON equality rejected the valid continuation with HTTP 409, causing repeated
+client retries after a successful Read. Native history/call matching now
+normalizes text strings into text blocks and ignores only content-block
+`cache_control` hints. Text, roles, message identity, tool IDs, names, numeric
+inputs (including large integers) and attachment sources remain exact. A
+`cache_control` property inside a tool's input is ordinary data and is retained.
+
 ### Conversation reuse and content-filter errors (2026-11-23)
 
 The upstream thread is stateful. A downstream conversation id is a local

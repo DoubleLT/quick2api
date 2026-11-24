@@ -86,26 +86,43 @@ func (c *ClientTools) ParseReply(text string) (narration string, calls []ToolCal
 		}
 		calls, ok = strictToolCalls(t)
 	}
-	if !ok || (c.single && len(calls) > 1) {
+	if !ok || c.ValidateCalls(calls) != nil {
 		return "", nil, false
+	}
+	return narration, calls, true
+}
+
+// ValidateCalls applies the client catalog and tool choice directly to typed
+// calls. Native transports must not serialize a call back into assistant prose
+// merely to reuse the text compatibility parser.
+func (c *ClientTools) ValidateCalls(calls []ToolCallJSON) error {
+	if c == nil || c.disabled || len(c.schemas) == 0 || len(calls) == 0 || (c.single && len(calls) > 1) {
+		return errors.New("client tool catalog or tool choice disallows this call")
 	}
 	ids := make(map[string]bool, len(calls))
 	for _, call := range calls {
+		if call.Type != "tool_use" {
+			return errors.New("client tool call must have type tool_use")
+		}
+		input, err := uniqueJSON(strings.NewReader(string(call.Input)))
+		if _, object := input.(map[string]any); err != nil || !object {
+			return errors.New("client tool arguments must be an unambiguous JSON object")
+		}
 		if c.only != "" && call.Name != c.only {
-			return "", nil, false
+			return errors.New("client tool choice disallows this tool")
 		}
 		schema, declared := c.schemas[call.Name]
 		if !declared || !validToolInput(schema, call.Input) {
-			return "", nil, false
+			return errors.New("client tool is undeclared or its arguments do not match its schema")
 		}
 		if call.ID != "" {
 			if ids[call.ID] {
-				return "", nil, false
+				return errors.New("duplicate client tool call id")
 			}
 			ids[call.ID] = true
 		}
 	}
-	return narration, calls, true
+	return nil
 }
 
 func actionNarration(prefix string) bool {

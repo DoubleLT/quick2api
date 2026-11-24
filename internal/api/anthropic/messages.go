@@ -40,6 +40,7 @@ type Handler struct {
 	Cfg    *config.Config
 	Debug  *debuglog.Logger
 	Sem    chan struct{}
+	Native *NativeBridge
 	// Tools is the server-side executor registry; nil = advisory mode
 	// (schemas go in the prompt, tool_use blocks come back as-is).
 	// *Registry over Executor so execFor can ask Has() for auto-mode
@@ -113,11 +114,16 @@ func (h *Handler) CountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req MessagesRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error())
+	if err := common.DecodeRequestBody(w, r, &req, h.Cfg.RequestBodyLimit()); err != nil {
+		status, kind, message := common.RequestBodyError(err)
+		writeErr(w, status, kind, message)
 		return
 	}
-	text, _, _, atts, err := renderPrompt(&req)
+	render := renderPrompt
+	if h.Native != nil {
+		render = renderNativePrompt
+	}
+	text, _, _, atts, err := render(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -142,8 +148,9 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req MessagesRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error())
+	if err := common.DecodeRequestBody(w, r, &req, h.Cfg.RequestBodyLimit()); err != nil {
+		status, kind, message := common.RequestBodyError(err)
+		writeErr(w, status, kind, message)
 		return
 	}
 	if len(req.Messages) == 0 {
@@ -151,7 +158,11 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	text, tailAt, lastMsgAt, atts, err := renderPrompt(&req)
+	render := renderPrompt
+	if h.Native != nil {
+		render = renderNativePrompt
+	}
+	text, tailAt, lastMsgAt, atts, err := render(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -193,6 +204,11 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 	// first message's client-supplied id). Falls back to a fresh conv each
 	// request — the bridge drops stale conns automatically.
 	conversationID := conversationIDOf(r, &req)
+	if h.Native != nil {
+		req.Model = model
+		h.serveNative(w, r, reqID, model, conversationID, text, tail, final, atts, &req)
+		return
+	}
 	clientTools := clientHasTools(req.Tools)
 	toolCount := clientToolCount(req.Tools)
 

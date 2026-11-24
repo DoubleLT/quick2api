@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/url"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -50,6 +51,11 @@ func (t *turn) send(inner map[string]any) error {
 		return err
 	}
 	slog.Debug("ws send", "type", inner["type"], "len", len(b))
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if err := t.ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
 	return t.ws.WriteMessage(websocket.BinaryMessage, b)
 }
 
