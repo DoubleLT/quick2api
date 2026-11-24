@@ -60,7 +60,7 @@ class MessageSSE {
   }
 }
 
-function post({endpoint,key,session,payload,signal,timeoutMs=180000,onHeaders,onEvent,requestId:sentId='regression-'+randomUUID()}) {
+function postOnce({endpoint,key,session,payload,signal,timeoutMs=180000,onHeaders,onEvent,requestId:sentId='regression-'+randomUUID()}) {
   const url=new URL(endpoint);
   if(url.protocol!=='http:'||!['127.0.0.1','localhost','[::1]'].includes(url.hostname))throw Error('Regression endpoint must be local HTTP');
   const body=JSON.stringify(payload),start=performance.now();
@@ -98,5 +98,33 @@ function post({endpoint,key,session,payload,signal,timeoutMs=180000,onHeaders,on
     request.setTimeout(timeoutMs,()=>request.destroy(Error('Regression request timeout')));
     request.on('error',fail);request.end(body);
   });
+}
+
+// Quick limits new upstream sessions in windows: a burst succeeds, then setup is
+// closed with 1011 for about a minute. The proxy reports this before any user
+// message is sent, so waiting and resending cannot run anything twice. Only that
+// exact condition is resent; all other failures (including content filtering) are not.
+const SETUP_REJECTED=/Quick connection setup (?:failed|timed out) at session_(?:connect|create) \(WebSocket close 1011\); no user message was sent/;
+const sleepMs=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+async function post(options) {
+  const {setupCooldownMs=90000,setupAttempts=4,sleep=sleepMs,...rest}=options;
+  const baseId=options.requestId||'regression-'+randomUUID(),cooldowns=[];
+  for(let attempt=1;;attempt++) {
+    const requestId=attempt===1?baseId:baseId+'-setup'+attempt;
+    try {
+      const result=await postOnce({...rest,requestId});
+      if(cooldowns.length)result.setupCooldowns=cooldowns;
+      return result;
+    } catch(error) {
+      const rejected=SETUP_REJECTED.test(error.evidence?.raw||'');
+      if(!rejected||attempt>=setupAttempts||options.signal?.aborted) {
+        if(cooldowns.length&&error.evidence)error.evidence.setupCooldowns=cooldowns;
+        throw error;
+      }
+      cooldowns.push({requestId,waitedMs:setupCooldownMs});
+      await sleep(setupCooldownMs);
+    }
+  }
 }
 module.exports={MessageSSE,post};

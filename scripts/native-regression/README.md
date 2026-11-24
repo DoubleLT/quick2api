@@ -33,6 +33,13 @@ Fixture color answers come from the test client; no human business decision
 is made. Every other client action is rejected without execution. Tool calls
 are delivered only after the complete response and tool JSON arrive.
 
+For the fixed A–D checklist, add `--checklist`. This skips the original-message
+observation and starts D1, D2, D3 and D5 from separate complete history copies
+and fresh IDs. D4 continues D3's actual error exchange when valid; a failed or
+refused scenario resets the next distinct scenario. Reports retain request
+IDs, timestamps, latency, stop reasons and tool delivery for each HTTP request.
+Provider refusals remain separate from local failures and are never retried.
+
 A transport/protocol exception saves private evidence and resets the next
 distinct planned scenario to the complete base history and a fresh ID. It does
 not resend the failed action. Refusals are recorded as failures; a filtered
@@ -118,6 +125,7 @@ upstream 1011 or override upstream filtering.
 
 ```powershell
 go run ./scripts/native-regression/handshake -config <candidate-config> -out <new-private-report>
+go run ./scripts/native-regression/handshake -parallel 12 -config <candidate-config> -out <new-private-report>
 ```
 
 This diagnostic owns a temporary outpost on an ephemeral port, reads its own
@@ -127,6 +135,10 @@ and closes every connection and its own outpost. Reports contain only stages,
 frame types, elapsed times and error categories/codes. Failed probes save the
 report and exit nonzero. Use a new report path; existing files are never
 overwritten. Do not infer model or Desktop acceptance from this probe.
+The `-parallel 12` mode starts all twelve probes together for checklist B1;
+the setup gate still serializes their handshakes. Each probe records a local
+request ID, start timestamp and cumulative stage times. Other local processes
+are outside this gate.
 
 Before process-wide setup serialization, the live matrix passed serial 6/6
 and paired 4/6, with two 1011 closures before the first acknowledgement. The
@@ -145,3 +157,13 @@ failure in these new model tests. This is further evidence that transport
 repair does not establish stable old-history acceptance. The filtered
 question was not retried; the original-message observation delivered no client
 tool and was not counted as a gate.
+
+## Upstream new-session limit and setup cooldown
+
+Quick limits new sessions per device: about four succeed, then setup is closed
+with WebSocket 1011 for roughly a minute. The proxy reports this before any user
+message is sent. `client.cjs` therefore waits 90 seconds and resends only that
+exact condition (new request ID suffix `-setupN`, at most four attempts); each
+wait is recorded as `setupCooldowns`. Content filtering and every failure after a
+possible send are never resent. The handshake diagnostic takes `-cooldown 90`
+for the same behavior; reports then include `cooldownWaits`.

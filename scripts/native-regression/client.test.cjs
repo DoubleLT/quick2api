@@ -84,3 +84,41 @@ test('SSE heartbeats cannot extend the total request deadline',async t=>{
  await new Promise(resolve=>srv.listen(0,'127.0.0.1',resolve));t.after(()=>srv.close());
  await assert.rejects(post({endpoint:'http://127.0.0.1:'+srv.address().port,key:'fixture',session:'fixture',payload:{stream:true},timeoutMs:80}),error=>/deadline exceeded/.test(error.message)&&error.evidence.status===200);
 });
+
+const setupFailure=id=>'event: message_start\ndata: '+JSON.stringify({type:'message_start',message:{id,content:[],stop_reason:null}})+'\n\nevent: error\ndata: '+JSON.stringify({type:'error',error:{type:'api_error',message:'Quick connection setup failed at session_connect (WebSocket close 1011); no user message was sent'}})+'\n\n';
+const okMessage='event: message_start\ndata: '+JSON.stringify({type:'message_start',message:{id:'ok',content:[],stop_reason:null}})+'\n\nevent: message_delta\ndata: '+JSON.stringify({type:'message_delta',delta:{stop_reason:'end_turn'}})+'\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+async function withServer(replies,fn){
+  const seen=[];
+  const server=http.createServer((req,res)=>{seen.push(req.headers['x-request-id']);res.writeHead(200,{'content-type':'text/event-stream'});res.end(replies[Math.min(seen.length-1,replies.length-1)](seen.length));});
+  await new Promise(r=>server.listen(0,'127.0.0.1',r));
+  try{return await fn('http://127.0.0.1:'+server.address().port+'/v1/messages',seen);}finally{server.close();}
+}
+const req=endpoint=>({endpoint,key:'k',session:'s',payload:{stream:true,messages:[]},requestId:'case'});
+
+test('setup 1011 before any user message waits for cooldown then resends with a new request id',async()=>{
+  const waits=[];
+  await withServer([()=>setupFailure('x'),()=>okMessage],async(endpoint,seen)=>{
+    const r=await post({...req(endpoint),setupCooldownMs:5,sleep:ms=>{waits.push(ms);return Promise.resolve();}});
+    assert.equal(r.reply.stop_reason,'end_turn');
+    assert.deepEqual(waits,[5]);assert.equal(seen.length,2);
+    assert.equal(seen[0],'case');assert.notEqual(seen[1],'case');
+    assert.deepEqual(r.setupCooldowns,[{requestId:'case',waitedMs:5}]);
+  });
+});
+
+test('setup cooldown is bounded and then reports the last failure with its history',async()=>{
+  await withServer([()=>setupFailure('x')],async(endpoint,seen)=>{
+    await assert.rejects(post({...req(endpoint),setupCooldownMs:1,setupAttempts:3,sleep:()=>Promise.resolve()}),error=>{
+      assert.equal(error.message,'SSE upstream error');assert.equal(error.evidence.setupCooldowns.length,2);return true;
+    });
+    assert.equal(seen.length,3);
+  });
+});
+
+test('failures after a user message was possible are never resent',async()=>{
+  const midStream=()=>'event: message_start\ndata: {"type":"message_start","message":{"id":"x","content":[],"stop_reason":null}}\n\nevent: error\ndata: {"type":"error","error":{"type":"api_error","message":"upstream content_filter"}}\n\n';
+  await withServer([midStream],async(endpoint,seen)=>{
+    await assert.rejects(post({...req(endpoint),setupCooldownMs:1,sleep:()=>Promise.resolve()}));
+    assert.equal(seen.length,1);
+  });
+});

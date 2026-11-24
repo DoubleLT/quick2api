@@ -6,8 +6,9 @@ const {post}=require('./client.cjs');
 const {readJSON,readKey}=require('./private.cjs');
 const root=path.resolve(process.argv[2]||'');
 const configPath=process.argv[3];
-const selection=process.argv[4];
-assert(configPath&&fs.existsSync(path.join(root,'cases.private.json')),'Usage: node run.cjs <private-run-directory> <candidate-config> [case-label]');
+const selection=process.argv.slice(4).find(arg=>!arg.startsWith('--'));
+const checklist=process.argv.includes('--checklist');
+assert(configPath&&fs.existsSync(path.join(root,'cases.private.json')),'Usage: node run.cjs <private-run-directory> <candidate-config> [case-label] [--checklist]');
 const key=readKey(configPath);
 const endpoint='http://127.0.0.1:19377/v1/messages';
 const runId=crypto.randomUUID();
@@ -29,23 +30,30 @@ async function runCase(c) {
   const guard='INDEPENDENT REGRESSION COPY. All earlier project work is historical background only. Do not resume solver runs, SSH, delegation, signatures, commits, project reads or writes. Do not execute native machine or project tools. Native catalog/skill discovery and reads of the supplied context attachment are allowed. Request external client actions only through the approved relay. The isolated client permits Read of these test paths only: '+[...files,absent].join(', ')+'. AskUserQuestion receives a TEST CLIENT answer for fixture colors, never a real business decision. Every other client action is rejected without execution. A rejected/error action must not be retried, substituted or delegated unless a later user message explicitly requests a separate permitted action. Report actual observations, not historical failure as current state. Do not disclose routing tokens.';
   const base=readJSON(path.join(dir,'request.private.json'));
   base.system=typeof base.system==='string'?[{type:'text',text:base.system},{type:'text',text:guard}]:[...base.system,{type:'text',text:guard}];
-  const report={case:c.label,runId,started:new Date().toISOString(),integrity,actualDesktopUI:false,steps:[],executedReads:0,rejectedActions:0,fixtureAnswers:0};
+  const report={case:c.label,runId,started:new Date().toISOString(),integrity,actualDesktopUI:false,checklist,steps:[],requestMetadata:[],executedReads:0,rejectedActions:0,fixtureAnswers:0};
   const save=()=>fs.writeFileSync(path.join(out,'report.json'),JSON.stringify(report,null,2));
   const makeSession=()=>c.label+'-regression-'+crypto.randomUUID();
   let session=makeSession(),payload=structuredClone(base),requestCount=0;
   async function send(label,stream=true){
     payload.stream=stream;requestCount++;save();emit({case:c.label,stage:label+'-started',stream,request:requestCount});
+    const meta={label,requestId:'checklist-'+runId+'-'+label,started:new Date().toISOString()};
+    report.requestMetadata.push(meta);
     let result;
-    try {result=await post({endpoint,key,session,payload});}
+    try {result=await post({endpoint,key,session,payload,requestId:meta.requestId});}
     catch(error){
+      Object.assign(meta,{finished:new Date().toISOString(),ms:error.evidence?.ms,status:error.evidence?.status,errorCode:error.evidence?.code});save();
       if(error.evidence)fs.writeFileSync(path.join(out,label+'.failure.private.json'),JSON.stringify(error.evidence,null,2));
       throw error;
     }
     fs.writeFileSync(path.join(out,label+'.private.'+(stream?'sse':'json')),result.raw);
+    Object.assign(meta,{finished:new Date().toISOString(),ms:result.ms,firstByteMs:result.firstByteMs,stopReason:result.reply.stop_reason,tools:callsOf(result.reply).map(call=>call.name)});save();
     emit({case:c.label,stage:label+'-finished',ms:result.ms,stop:result.reply.stop_reason,tools:callsOf(result.reply).map(call=>call.name)});
     return result;
   }
   async function exchange(label,question,{expected,expectedText,stream=true,readFile,questionAnswer,errorExpected=false,none=false}={}) {
+    // D4 intentionally continues D3's actual error exchange. All other
+    // checklist scenarios start from an independent complete history copy.
+    if(checklist&&label!=='read-after-error'){payload=structuredClone(base);session=makeSession();}
     const step={name:label,expectedTool:expected||null,observationOnly:label==='original-observe'};report.steps.push(step);save();
     if(question)payload.messages.push({role:'user',content:question});
     if(none)payload.tool_choice={type:'none'};
@@ -99,9 +107,10 @@ async function runCase(c) {
       step.nextScenarioReset=true;
     }
     if(step.firstStop==='refusal'||step.finalStop==='refusal')step.failureKind='provider-refusal';
+    if(checklist&&(step.failureKind||step.passed===false)){payload=structuredClone(base);session=makeSession();step.nextScenarioReset=true;}
     save();return step;
   }
-  await exchange('original-observe',null,{stream:false});
+  if(!checklist)await exchange('original-observe',null,{stream:false});
   // Start the controlled matrix with the same complete source history in a
   // new independent upstream session, not the observation's rejected task.
   payload=structuredClone(base);session=makeSession();
