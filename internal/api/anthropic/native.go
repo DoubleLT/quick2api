@@ -714,6 +714,14 @@ func (b *NativeBridge) start(req *MessagesRequest, conversation string, opts cha
 			copy.Text = final.Text[publishedBytes:]
 			final = &copy
 		}
+		// A setup failure sent no user message, so the identical client retry
+		// must be admitted. Release before Complete so the retry cannot race it.
+		var setupErr *chat.ConnectionSetupError
+		if errors.As(err, &setupErr) {
+			b.mu.Lock()
+			delete(b.seen, t.requestKey)
+			b.mu.Unlock()
+		}
 		t.exchange.Complete(final, err)
 		<-t.exchange.Done()
 		b.remove(t)
