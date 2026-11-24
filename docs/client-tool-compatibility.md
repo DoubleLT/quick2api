@@ -57,6 +57,28 @@ This extension applies only to Anthropic client passthrough; OpenAI parsing and
 server tool execution retain their existing behavior. No prompt rewriting,
 content-filter retry, or native device bridge is introduced.
 
+### Tool history loses call/result relationships or attachment output
+
+The Anthropic transcript renderer previously removed call IDs, concatenated
+text blocks in tool results, and ignored nested result images/documents. It now
+renders `ToolUse` and `ToolResult` as JSON envelopes containing the original
+call IDs, `tool_use_id`, error flags, and distinct content blocks. Out-of-order
+results remain associated with their calls. Embedded newlines stay inside the
+serialized result instead of becoming transcript separators.
+
+Nested result images/documents are uploaded as attachments and referenced by
+deterministic names inside the result envelope. Re-rendering an unchanged
+history preserves the same transcript watermark. Uploads retain the real MIME
+type. A failed client attachment upload now returns an error instead of
+silently omitting the part. Explicit policy denial maps to a permission error;
+blocked or unchecked context cannot fall back to text chunks.
+When an ordinary context upload failure uses chunk fallback, already delivered
+client attachments remain attached to the final answering turn.
+
+These are input-fidelity fixes. They do not establish that historical tool
+correlation loss caused Quick's natural-language refusal, or implement native
+Quick-to-Desktop tool registration.
+
 ### Large histories lose the operative request or tool schema
 
 Oversized prompts use the existing attachment path. Trailing environment
@@ -101,6 +123,12 @@ schema validation, tool choice, multiple tool blocks, and single-delivery SSE
 arguments. These are local parser/state tests, not simulated upstream
 proof.
 
+Tool-history regressions additionally cover reversed call results, error flags,
+text block boundaries, deterministic nested attachment references, and invalid
+result content. Attachment-policy tests verify that explicit denials override
+skip statuses, unchecked policy outcomes cannot use chunk fallback, and missing
+upload sessions cannot silently discard client attachments.
+
 Live checks against a signed-in Quick account established:
 
 - Before serialization, two overlapping requests for one conversation asking
@@ -123,6 +151,16 @@ Live checks against a signed-in Quick account established:
   argument delta per call. The exact mixed final-span reply is covered by a
   local regression; those live loops did not establish a Desktop replay of
   that precise formatting or resolve refusals in large old histories.
+- The subsequent history-fidelity candidate passed a fresh streaming fixture
+  Read/result/first-line loop. Returning the actual file bytes as a nested
+  document also delivered the correct contents, but Quick added a source
+  citation suffix; this did not pass the exact-output assertion. A separate
+  107827-byte synthetic history with reversed result IDs was content-filtered
+  and was not retried or rewritten. Long-history acceptance remains unverified;
+  no image end-to-end result is claimed.
+- After the metadata-preservation adjustment, both the rebuilt candidate and
+  deployed service passed a fresh streaming fixture Read/result/first-line
+  loop. This checks the API tool round trip, not arbitrary old Desktop sessions.
 
 For an installation check, build `./cmd/quick2api` and run
 `quick2api -config <your-config> -probe`. Use a proxy-owned outpost and a

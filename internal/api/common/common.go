@@ -71,16 +71,21 @@ func Acquire(ctx context.Context, sem chan struct{}) (release func(), ok bool) {
 type UpstreamKind int
 
 const (
-	KindUpstream        UpstreamKind = iota // generic upstream failure → 502
-	KindUnauthenticated                     // upstream says creds bad/expired → 401
-	KindRateLimited                         // upstream throttled → 429
-	KindTimeout                             // ctx deadline → 504
+	KindUpstream         UpstreamKind = iota // generic upstream failure → 502
+	KindUnauthenticated                      // upstream says creds bad/expired → 401
+	KindRateLimited                          // upstream throttled → 429
+	KindTimeout                              // ctx deadline → 504
+	KindPermissionDenied                     // attachment policy blocked input → 403
 )
 
 // UpstreamError maps err to (httpStatus, kind, message). Message is the
 // user-facing text: UpstreamError.Message for typed frames, err.Error()
 // otherwise (it carries the "upstream: " prefix).
 func UpstreamError(err error) (status int, kind UpstreamKind, message string) {
+	var policy *chat.AttachmentPolicyError
+	if errors.As(err, &policy) && policy.Blocked {
+		return http.StatusForbidden, KindPermissionDenied, policy.Message
+	}
 	var ue *chat.UpstreamError
 	if errors.As(err, &ue) {
 		switch ue.Code {

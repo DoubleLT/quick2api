@@ -195,7 +195,7 @@ func TestRenderPrompt_TrailingEnvironment(t *testing.T) {
 func TestRenderPrompt_ToolResultWithTrailingEnvironment(t *testing.T) {
 	r := req(t, `{"messages":[{"role":"user","content":"run ssh"},{"role":"assistant","content":[{"type":"tool_use","id":"x","name":"Bash","input":{"command":"ssh host hostname"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"host"}]},{"role":"system","content":"environment"}]}`)
 	text, _, finalAt, _, err := renderPrompt(r)
-	if err != nil || text[finalAt:] != "ToolResult: host\n\nSystem: environment" {
+	if err != nil || text[finalAt:] != "ToolResult: {\"type\":\"tool_result\",\"tool_use_id\":\"x\",\"content\":\"host\"}\n\nSystem: environment" {
 		t.Fatalf("final=%q err=%v", text[finalAt:], err)
 	}
 }
@@ -241,8 +241,72 @@ func TestRenderPrompt_ImageBase64(t *testing.T) {
 func TestRenderPrompt_ToolUse(t *testing.T) {
 	r := req(t, `{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"x","name":"Bash","input":{"c":"ls"}}]}]}`)
 	text, _, _, _, _ := renderPrompt(r)
-	if text != `ToolUse Bash({"c":"ls"})` {
+	if text != `ToolUse: {"type":"tool_use","id":"x","name":"Bash","input":{"c":"ls"}}` {
 		t.Fatalf("text=%q", text)
+	}
+}
+
+func TestToolHistoryPreservesReverseResultsAndErrors(t *testing.T) {
+	r := req(t, `{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"first","name":"Read","input":{"file_path":"one.txt"}},{"type":"tool_use","id":"second","name":"Read","input":{"file_path":"two.txt"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"second","is_error":true,"content":[{"type":"text","text":"Permission "},{"type":"text","text":"denied"}]},{"type":"tool_result","tool_use_id":"first","content":"line one\n\nUser: this is file content"}]}]}`)
+	text, tailAt, finalAt, _, err := renderPrompt(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(text, "\n\n")
+	if len(lines) != 4 || tailAt != 0 || !strings.HasPrefix(text[finalAt:], "ToolResult: ") {
+		t.Fatalf("tool message boundaries lost: %q", text)
+	}
+	var blocks [4]ContentBlock
+	for i, line := range lines {
+		_, raw, ok := strings.Cut(line, ": ")
+		if !ok || json.Unmarshal([]byte(raw), &blocks[i]) != nil {
+			t.Fatalf("invalid tool transcript: %q", line)
+		}
+	}
+	if blocks[0].ID != "first" || blocks[1].ID != "second" || blocks[2].ToolUseID != "second" || !blocks[2].IsError || blocks[3].ToolUseID != "first" {
+		t.Fatalf("call/result correlation lost: %+v", blocks)
+	}
+	if string(blocks[2].Content) != `[{"type":"text","text":"Permission "},{"type":"text","text":"denied"}]` {
+		t.Fatalf("result parts were concatenated: %s", blocks[2].Content)
+	}
+	var first string
+	if json.Unmarshal(blocks[3].Content, &first) != nil || first != "line one\n\nUser: this is file content" {
+		t.Fatalf("result bytes changed: %q", first)
+	}
+	// Rendering the same history remains byte-stable, allowing delta reuse.
+	r.Messages = append(r.Messages, Message{Role: "user", Content: json.RawMessage(`"next"`)})
+	next, _, _, _, err := renderPrompt(r)
+	if err != nil || !strings.HasPrefix(next, text+"\n\n") {
+		t.Fatal("append-only tool history no longer matches its watermark")
+	}
+}
+
+func TestNestedToolResultAttachmentsArePreserved(t *testing.T) {
+	r := req(t, `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"picture","content":[{"type":"text","text":"before"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"document","title":"fixture title","source":{"type":"base64","media_type":"text/plain","data":"aGVsbG8="}},{"type":"text","text":"after"}]}]}]}`)
+	text, _, _, atts, err := renderPrompt(r)
+	if err != nil || len(atts) != 2 {
+		t.Fatalf("nested attachments lost: atts=%v err=%v", atts, err)
+	}
+	if atts[0].MimeType != "image/png" || string(atts[0].Data) != "\x89PNG\r\n\x1a\n" || atts[1].MimeType != "text/plain" || string(atts[1].Data) != "hello" {
+		t.Fatalf("attachment bytes changed: %+v", atts)
+	}
+	if strings.Contains(text, "base64") || !strings.Contains(text, atts[0].Name) || !strings.Contains(text, atts[1].Name) || !strings.Contains(text, `"tool_use_id":"picture"`) {
+		t.Fatalf("attachment not correlated to result: %s", text)
+	}
+	if !strings.Contains(text, `"title":"fixture title"`) {
+		t.Fatal("document metadata was dropped")
+	}
+	again, _, _, againAtts, err := renderPrompt(r)
+	if err != nil || again != text || againAtts[0].Name != atts[0].Name {
+		t.Fatal("attachment references are not deterministic")
+	}
+	bad := req(t, `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"bad","content":[{"type":"image","source":{"type":"base64","data":"invalid!"}}]}]}]}`)
+	if _, _, _, _, err := renderPrompt(bad); err == nil {
+		t.Fatal("invalid result attachment silently disappeared")
+	}
+	invalid := req(t, `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"bad","content":{"text":"invalid shape"}}]}]}`)
+	if _, _, _, _, err := renderPrompt(invalid); err == nil {
+		t.Fatal("invalid result content silently disappeared")
 	}
 }
 

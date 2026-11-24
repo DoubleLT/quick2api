@@ -15,6 +15,7 @@ package anthropic
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -502,12 +503,17 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 
 	if err != nil {
 		h.finishDebug(dlogDir, nil, err)
+		_, kind, message := common.UpstreamError(err)
+		errorType := "api_error"
+		if kind == common.KindPermissionDenied {
+			errorType = "permission_error"
+		}
 		emit("message_delta", map[string]any{
 			"delta": map[string]any{"stop_reason": "error"},
 			"usage": map[string]any{"output_tokens": 0},
 		})
 		emit("error", map[string]any{"type": "error", "error": map[string]any{
-			"type": "api_error", "message": err.Error(),
+			"type": errorType, "message": message,
 		}})
 		emit("message_stop", map[string]any{})
 		return
@@ -709,29 +715,20 @@ func renderPrompt(req *MessagesRequest) (text string, tailAt, lastMsgAt int, att
 					atts = append(atts, *a)
 				}
 			case "tool_use":
-				fmt.Fprintf(&b, "ToolUse %s(%s)\n\n", bl.Name, string(bl.Input))
+				// Keep the correlation ID and escape embedded newlines. A tool
+				// transcript is data, not a new User/System instruction.
+				data, marshalErr := json.Marshal(ContentBlock{Type: bl.Type, ID: bl.ID, Name: bl.Name, Input: bl.Input})
+				if marshalErr != nil {
+					return "", 0, 0, nil, fmt.Errorf("tool_use: %w", marshalErr)
+				}
+				fmt.Fprintf(&b, "ToolUse: %s\n\n", data)
 			case "tool_result":
-				inner := ""
-				if len(bl.Content) > 0 {
-					var s string
-					if json.Unmarshal(bl.Content, &s) == nil {
-						inner = s
-					} else {
-						var parts []ContentBlock
-						if json.Unmarshal(bl.Content, &parts) == nil {
-							for _, p := range parts {
-								if p.Type == "text" {
-									inner += p.Text
-								}
-							}
-						}
-					}
+				data, resultAtts, resultErr := renderToolResult(bl)
+				if resultErr != nil {
+					return "", 0, 0, nil, fmt.Errorf("tool_result: %w", resultErr)
 				}
-				label := "ToolResult"
-				if bl.IsError {
-					label += " (error)"
-				}
-				fmt.Fprintf(&b, "%s: %s\n\n", label, inner)
+				atts = append(atts, resultAtts...)
+				fmt.Fprintf(&b, "ToolResult: %s\n\n", data)
 			default:
 				// thinking/redacted_thinking/etc — dropped silently.
 			}
@@ -746,6 +743,55 @@ func renderPrompt(req *MessagesRequest) (text string, tailAt, lastMsgAt int, att
 		return "", 0, 0, nil, errors.New("messages rendered to empty text")
 	}
 	return out, tailAt, lastMsgAt, atts, nil
+}
+
+// renderToolResult preserves IDs, errors and content-block boundaries. Images
+// and documents inside results use the same upload path as top-level content;
+// base64 bytes are replaced by stable attachment references in the transcript.
+func renderToolResult(bl ContentBlock) ([]byte, []chat.Attachment, error) {
+	var atts []chat.Attachment
+	var parts []json.RawMessage
+	var text string
+	if len(bl.Content) > 0 && string(bl.Content) != "null" && json.Unmarshal(bl.Content, &text) != nil {
+		if err := json.Unmarshal(bl.Content, &parts); err != nil {
+			return nil, nil, errors.New("content must be a string or blocks")
+		}
+		digest := sha256.Sum256(bl.Content)
+		for i, raw := range parts {
+			var part ContentBlock
+			if err := json.Unmarshal(raw, &part); err != nil {
+				return nil, nil, err
+			}
+			var att *chat.Attachment
+			var err error
+			switch part.Type {
+			case "image":
+				att, err = attachmentFromImageBlock(&part)
+			case "document":
+				att, err = attachmentFromDocumentBlock(&part)
+			default:
+				continue // retain other blocks verbatim, including text
+			}
+			if err != nil {
+				return nil, nil, err
+			}
+			if att == nil {
+				return nil, nil, errors.New("missing result attachment")
+			}
+			att.Name = fmt.Sprintf("tool-result-%x-%d.%s", digest[:8], i, extForMime(att.MimeType))
+			atts = append(atts, *att)
+			var reference map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &reference); err != nil {
+				return nil, nil, err
+			}
+			delete(reference, "source")
+			reference["attachment"], _ = json.Marshal(att.Name)
+			parts[i], _ = json.Marshal(reference)
+		}
+		bl.Content, _ = json.Marshal(parts)
+	}
+	data, err := json.Marshal(ContentBlock{Type: "tool_result", ToolUseID: bl.ToolUseID, Content: bl.Content, IsError: bl.IsError})
+	return data, atts, err
 }
 
 // attachmentFromImageBlock converts an Anthropic `image` content block
@@ -934,6 +980,8 @@ func writeUpstream(w http.ResponseWriter, err error) {
 		typ = "rate_limit_error"
 	case common.KindTimeout:
 		typ = "timeout"
+	case common.KindPermissionDenied:
+		typ = "permission_error"
 	}
 	writeErr(w, status, typ, msg)
 }

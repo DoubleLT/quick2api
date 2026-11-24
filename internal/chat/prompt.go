@@ -42,17 +42,22 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 	// server path returned by the deliver call.
 	var wireAtts []map[string]any
 	canUpload := sess != nil && sess.TenantURL != "" && sess.IDToken != ""
+	if len(opts.Attachments) > 0 && !canUpload {
+		return nil, fmt.Errorf("input attachments cannot be uploaded: no bound upload session")
+	}
 	if canUpload {
 		for _, att := range opts.Attachments {
 			mime := att.MimeType
 			if mime == "" {
 				mime = "application/octet-stream"
 			}
-			path, attID, err := uploadAttachment(ctx, sess, conversationID, att.Name, att.Data)
+			path, attID, err := uploadAttachment(ctx, sess, conversationID, att.Name, mime, att.Data)
 			slog.Debug("attachment upload", "name", att.Name, "path", path, "attID", attID, "err", err)
 			if err != nil || path == "" {
-				slog.Warn("attachment upload failed; dropping part", "name", att.Name, "err", err)
-				continue
+				if err == nil {
+					err = fmt.Errorf("upload returned an empty attachment path")
+				}
+				return nil, fmt.Errorf("input attachment %q was not delivered: %w", att.Name, err)
 			}
 			wireAtts = append(wireAtts, map[string]any{
 				"type":         attachmentKind(mime),
@@ -95,7 +100,7 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 				}
 			}
 		}
-		path, attID, err := uploadAttachment(ctx, sess, conversationID, ctxName, ctxData)
+		path, attID, err := uploadAttachment(ctx, sess, conversationID, ctxName, "text/plain", ctxData)
 		slog.Debug("sendPrompt upload attempt", "path", path, "attID", attID, "err", err)
 		if err == nil && path != "" {
 			wireAtts = append(wireAtts, map[string]any{
@@ -119,6 +124,9 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 			}
 			slog.Warn("attachment path returned empty/failed; falling back to chunks", "err", err)
 		} else if err != nil {
+			if !uploadFallbackAllowed(err) {
+				return nil, err
+			}
 			slog.Warn("attachment upload failed; falling back to chunks", "error", err)
 		}
 	}
@@ -128,12 +136,16 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 	var last *TurnResult
 	for i, ch := range chunks {
 		text := ch
+		var chunkAtts []map[string]any
 		if i < len(chunks)-1 {
 			text = fmt.Sprintf("[CONTEXT PART %d/%d — do not answer yet, just store this context]\n%s", i+1, len(chunks), ch)
 		} else {
 			text = fmt.Sprintf("[CONTEXT PART %d/%d — final part. Now answer based on ALL parts above.]\n%s", i+1, len(chunks), ch)
+			// Caller attachments were already delivered above. Keep them on
+			// the answering turn if only the context upload required fallback.
+			chunkAtts = wireAtts
 		}
-		if err := sendUserMessage(t, conversationID, text, opts, nil); err != nil {
+		if err := sendUserMessage(t, conversationID, text, opts, chunkAtts); err != nil {
 			return nil, err
 		}
 		got, err := t.collect(ctx, &TurnResult{FinishReason: "stop"})

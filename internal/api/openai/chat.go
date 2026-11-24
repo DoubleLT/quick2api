@@ -469,8 +469,13 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 		h.finishDebug(dlogDir, nil, err)
 		// OpenAI streams still terminate with [DONE]; send an error event
 		// chunk so clients see a typed failure rather than a silent cut.
+		_, kind, message := common.UpstreamError(err)
+		errorType := "upstream_error"
+		if kind == common.KindPermissionDenied {
+			errorType = "permission_error"
+		}
 		emit(map[string]any{"error": map[string]any{
-			"type": "upstream_error", "message": err.Error(),
+			"type": errorType, "message": message,
 		}})
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		fl.Flush()
@@ -814,6 +819,8 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 		typ = "rate_limit_error"
 	case common.KindTimeout:
 		typ = "timeout"
+	case common.KindPermissionDenied:
+		typ = "permission_error"
 	}
 	// keep the upstream's own code in the "code" field when present.
 	var ue *chat.UpstreamError

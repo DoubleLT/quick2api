@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -34,18 +35,21 @@ import (
 //
 // The returned serverPath goes onto user_message payload.attachments[].path;
 // the model reads the file server-side in one turn.
-func uploadAttachment(ctx context.Context, sess *session.Session, convID, name string, data []byte) (string, string, error) {
+func uploadAttachment(ctx context.Context, sess *session.Session, convID, name, mime string, data []byte) (string, string, error) {
 	if sess == nil || sess.IDToken == "" || sess.TenantURL == "" {
 		return "", "", fmt.Errorf("upload: no session bound")
 	}
 	auth := "Bearer " + sess.IDToken
 	httpc := &http.Client{Timeout: 30 * time.Second}
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
 
 	// 1. upload-attachment: raw bytes, octet-stream, id_token bearer.
 	up, err := http.NewRequestWithContext(ctx, "POST",
 		sess.TenantURL+"/integration/quick-work/upload-attachment"+
 			"?name="+url.QueryEscape(name)+
-			"&contentType="+url.QueryEscape("text/plain")+
+			"&contentType="+url.QueryEscape(mime)+
 			"&contentLength="+fmt.Sprint(len(data)),
 		bytes.NewReader(data))
 	if err != nil {
@@ -101,25 +105,25 @@ func uploadAttachment(ctx context.Context, sess *session.Session, convID, name s
 		dBody, _ := io.ReadAll(io.LimitReader(dResp.Body, 1<<20))
 		dResp.Body.Close()
 		slog.Debug("dlp-status", "attempt", i+1, "status", dResp.StatusCode, "body", trunc(string(dBody), 400))
+		if dResp.StatusCode/100 != 2 {
+			return "", "", &AttachmentPolicyError{Message: fmt.Sprintf("attachment policy check returned HTTP %d", dResp.StatusCode)}
+		}
 		var dOut struct {
 			DLPJobStatus string `json:"dlpJobStatus"`
 			PolicyAction string `json:"policyAction"`
 		}
 		if err := json.Unmarshal(dBody, &dOut); err != nil {
-			return "", "", fmt.Errorf("dlp-status decode: %w", err)
+			return "", "", &AttachmentPolicyError{Message: "attachment policy check returned invalid JSON"}
 		}
-		switch strings.ToUpper(dOut.PolicyAction) {
-		case "ALLOW":
-			goto deliver
-		case "BLOCK", "DENY", "REJECT":
-			return "", "", fmt.Errorf("dlp blocked: %s", trunc(string(dBody), 200))
+		cleared, policyErr := attachmentPolicyDecision(dOut.PolicyAction, dOut.DLPJobStatus)
+		if policyErr != nil {
+			return "", "", policyErr
 		}
-		switch strings.ToUpper(dOut.DLPJobStatus) {
-		case "SKIPPED", "NOT_APPLICABLE", "DISABLED":
+		if cleared {
 			goto deliver
 		}
 	}
-	return "", "", fmt.Errorf("dlp-status did not settle in time")
+	return "", "", &AttachmentPolicyError{Message: "attachment policy check did not settle in time"}
 
 deliver:
 	// 3. Deliver: bind attachmentId to the conversation, returns serverPath.
@@ -203,4 +207,33 @@ deliver:
 		return fin.Files[0].Path, attID, nil
 	}
 	return "", "", fmt.Errorf("deliver returned no path: %s", trunc(resp.Body, 300))
+}
+
+// AttachmentPolicyError distinguishes blocked or unchecked input from upload
+// transport failures. Such input must never be resent through the chunk path.
+type AttachmentPolicyError struct {
+	Blocked bool
+	Message string
+}
+
+func (e *AttachmentPolicyError) Error() string { return e.Message }
+
+func attachmentPolicyDecision(action, status string) (bool, error) {
+	switch strings.ToUpper(action) {
+	case "ALLOW":
+		return true, nil
+	case "BLOCK", "DENY", "REJECT":
+		return false, &AttachmentPolicyError{Blocked: true, Message: "attachment blocked by upstream content policy"}
+	case "":
+		switch strings.ToUpper(status) {
+		case "SKIPPED", "NOT_APPLICABLE", "DISABLED":
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func uploadFallbackAllowed(err error) bool {
+	var policy *AttachmentPolicyError
+	return !errors.As(err, &policy) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }

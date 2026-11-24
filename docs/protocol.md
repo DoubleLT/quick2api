@@ -193,7 +193,7 @@ the tenant's attachment service and references them from a short
 `user_message`; the model reads the file server-side in **one** turn.
 quick2api mirrors that path:
 
-1. `POST {tenant}/integration/quick-work/upload-attachment?name=…&contentType=text/plain&contentLength=…`
+1. `POST {tenant}/integration/quick-work/upload-attachment?name=…&contentType=<MIME>&contentLength=…`
    with the prompt as the octet-stream body → `{attachmentId}`.
 2. `GET {tenant}/integration/quick-work/attachment-dlp-status?attachmentId=…`
    polled until `policyAction=ALLOW` (or `dlpJobStatus` is
@@ -205,6 +205,13 @@ quick2api mirrors that path:
 4. `user_message` is sent with
    `payload.attachments=[{type:"file",name,size,mimeType,path,attachmentId}]`
    and a short text telling the model to read the file.
+
+Prompt/context uploads use `text/plain`; client-provided image and document
+uploads retain their MIME type. Tool-result attachments use this same path.
+If a caller-provided attachment cannot be delivered, return an error rather
+than dropping it and asking the model to answer without the input. An explicit
+DLP denial, a malformed/non-successful policy check, or an unsettled check
+terminates the request; none may fall back to sending the content as chunks.
 
 Note the classic MTU pattern: the ~64–80 KB limit lives in the frame
 codec, not the model — attachments bypass the frame entirely.
