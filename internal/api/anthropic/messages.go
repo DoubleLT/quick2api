@@ -7,8 +7,8 @@
 //
 // Scope: the text surface only. Client-declared tools are flattened
 // into a leading instruction block (the upstream agent sees their
-// schemas as text); tool_use content blocks in the request are
-// rendered as "ToolUse <name>(<json>)" so history stays coherent.
+// schemas as text); historical tool calls and results are rendered as
+// JSON envelopes retaining their correlation IDs and content blocks.
 // Stop sequences and max_tokens are passed positionally but the
 // upstream turn doesn't honor them server-side — they're metadata.
 package anthropic
@@ -418,41 +418,36 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	fl, ok := w.(http.Flusher)
+	_, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, "api_error", "streaming unsupported")
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 
-	emit := func(event string, v map[string]any) bool {
-		if err := writeSSE(w, event, v); err != nil {
-			return false
-		}
-		fl.Flush()
-		return true
-	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream := &messageStream{w: w, cancel: cancel}
+	emit := stream.emit
 
 	msgID := "msg_" + reqID
-	started := false
-	start := func() {
-		if started {
-			return
-		}
-		started = true
-		emit("message_start", map[string]any{
-			"message": map[string]any{
-				"id": msgID, "type": "message", "role": "assistant",
-				"model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-				"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
-			},
-		})
-		emit("content_block_start", map[string]any{
-			"index":         0,
-			"content_block": map[string]any{"type": "text", "text": ""},
-		})
+	if !emit("message_start", map[string]any{
+		"message": map[string]any{
+			"id": msgID, "type": "message", "role": "assistant",
+			"model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+		},
+	}) {
+		return
 	}
-	start()
+	if !emit("content_block_start", map[string]any{
+		"index":         0,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	}) {
+		return
+	}
+	stopKeepalive := stream.startKeepalive(ctx, streamPingInterval)
+	defer stopKeepalive()
 
 	// Live deltas only when nothing will intercept the answer: no
 	// executor on this request and no client-declared tools whose
@@ -482,6 +477,7 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 				"round": round, "calls": names,
 			})
 		})
+	stopKeepalive()
 	frames.Write(h.Debug, dlogDir)
 
 	var content []ContentBlock
@@ -492,37 +488,35 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	if !liveDeltas && len(content) > 0 && content[0].Type == "text" {
 		// Narration and tool calls are distinct blocks. Never stream the
 		// original JSON as text before classifying a buffered reply.
-		emit("content_block_delta", map[string]any{
+		if !emit("content_block_delta", map[string]any{
 			"index": 0,
 			"delta": map[string]any{"type": "text_delta", "text": content[0].Text},
-		})
+		}) {
+			return
+		}
 	}
 
-	// close the text block even on error — clients expect a terminated stream
-	emit("content_block_stop", map[string]any{"index": 0})
-
-	if err != nil {
-		h.finishDebug(dlogDir, nil, err)
-		_, kind, message := common.UpstreamError(err)
-		errorType := "api_error"
-		if kind == common.KindPermissionDenied {
-			errorType = "permission_error"
-		}
-		emit("message_delta", map[string]any{
-			"delta": map[string]any{"stop_reason": "error"},
-			"usage": map[string]any{"output_tokens": 0},
-		})
-		emit("error", map[string]any{"type": "error", "error": map[string]any{
-			"type": errorType, "message": message,
-		}})
-		emit("message_stop", map[string]any{})
+	if !emit("content_block_stop", map[string]any{"index": 0}) {
 		return
 	}
 
-	emitToolBlocks(emit, content)
+	if err != nil {
+		h.finishDebug(dlogDir, nil, err)
+		_, errorType, message := upstreamErrorDetails(err)
+		// An SSE error is terminal. "error" is not an Anthropic stop_reason,
+		// and a normal message_stop must not advertise a failed turn as done.
+		emit("error", map[string]any{"type": "error", "error": map[string]any{
+			"type": errorType, "message": message,
+		}})
+		return
+	}
+
+	if !emitToolBlocks(emit, content) {
+		return
+	}
 
 	u := mapUsage(res.Usage)
-	emit("message_delta", map[string]any{
+	if !emit("message_delta", map[string]any{
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
@@ -533,8 +527,12 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 			"cache_read_input_tokens":     u.CacheReadInputTokens,
 			"cache_creation_input_tokens": u.CacheCreationInputTokens,
 		},
-	})
-	emit("message_stop", map[string]any{})
+	}) {
+		return
+	}
+	if !emit("message_stop", map[string]any{}) {
+		return
+	}
 	h.finishDebug(dlogDir, &anthropicMessage{
 		ID: msgID, Type: "message", Role: "assistant",
 		Model: util.Or(res.ResolvedModel, model), Content: content,
@@ -578,7 +576,7 @@ func responseContent(res *chat.TurnResult, catalog *common.ClientTools) ([]Conte
 
 // Index 0 is the narration block started before the upstream turn. Each tool
 // gets its own subsequent block, with input supplied exactly once via deltas.
-func emitToolBlocks(emit func(string, map[string]any) bool, content []ContentBlock) {
+func emitToolBlocks(emit func(string, map[string]any) bool, content []ContentBlock) bool {
 	index := 1
 	for _, block := range content {
 		if block.Type != "tool_use" {
@@ -587,16 +585,17 @@ func emitToolBlocks(emit func(string, map[string]any) bool, content []ContentBlo
 		start := block
 		start.Input = json.RawMessage(`{}`)
 		if !emit("content_block_start", map[string]any{"index": index, "content_block": start}) {
-			return
+			return false
 		}
 		if !emit("content_block_delta", map[string]any{"index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(block.Input)}}) {
-			return
+			return false
 		}
 		if !emit("content_block_stop", map[string]any{"index": index}) {
-			return
+			return false
 		}
 		index++
 	}
+	return true
 }
 
 // SDK stream accumulators dispatch on the JSON type, not only the SSE event
@@ -971,6 +970,11 @@ func mapUsage(u *chat.TurnUsage) anthropicUsage {
 }
 
 func writeUpstream(w http.ResponseWriter, err error) {
+	status, typ, msg := upstreamErrorDetails(err)
+	writeErr(w, status, typ, msg)
+}
+
+func upstreamErrorDetails(err error) (int, string, string) {
 	status, kind, msg := common.UpstreamError(err)
 	typ := "api_error"
 	switch kind {
@@ -979,11 +983,11 @@ func writeUpstream(w http.ResponseWriter, err error) {
 	case common.KindRateLimited:
 		typ = "rate_limit_error"
 	case common.KindTimeout:
-		typ = "timeout"
+		typ = "timeout_error"
 	case common.KindPermissionDenied:
 		typ = "permission_error"
 	}
-	writeErr(w, status, typ, msg)
+	return status, typ, msg
 }
 
 func writeErr(w http.ResponseWriter, status int, typ, msg string) {

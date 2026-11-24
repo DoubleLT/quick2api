@@ -165,6 +165,9 @@ unavailable-model error. Do not retry it through the chunk fallback. After an
 error, cancellation, partial close, or guardrail termination, close the socket
 and discard its pending frames rather than pooling an ambiguous turn boundary.
 This preserves upstream checks; it does not remove Quick's agent constraints.
+Attachment-policy failures and request cancellation/deadlines must also be
+excluded from the bridge's fresh-connection retry path. Disabling chunk
+fallback alone does not prevent the bridge from repeating a failed upload.
 
 ### Native-tool narration before client tool JSON (2026-11-23)
 

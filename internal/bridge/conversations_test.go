@@ -3,10 +3,13 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/kilbertert/quick2api/internal/chat"
 )
 
 func TestConversationRequestsDoNotOverlap(t *testing.T) {
@@ -40,6 +43,23 @@ func TestConversationRequestsDoNotOverlap(t *testing.T) {
 	}
 	if len(locks.entries) != 0 {
 		t.Fatal("completed conversation locks leaked")
+	}
+}
+
+func TestPolicyAndCancelledTurnsNeverUseConnectionRetry(t *testing.T) {
+	for _, err := range []error{
+		&chat.AttachmentPolicyError{Blocked: true, Message: "blocked"},
+		&chat.AttachmentPolicyError{Message: "policy check unavailable"},
+		context.Canceled,
+		context.DeadlineExceeded,
+		&chat.UpstreamError{Code: "content_filtered", Message: "filtered"},
+	} {
+		if retryable(fmt.Errorf("turn failed: %w", err)) {
+			t.Fatalf("non-transport failure would be sent again: %v", err)
+		}
+	}
+	if !retryable(errors.New("upstream ws closed before message_complete")) {
+		t.Fatal("ordinary connection recovery was disabled")
 	}
 }
 

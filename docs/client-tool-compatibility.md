@@ -6,6 +6,24 @@ native Anthropic model API.
 
 ## Symptoms and fixes
 
+### A failed stream looks completed, or a buffered reply goes silent
+
+The Anthropic adapter used to send `stop_reason: error` followed by an error
+event and normal `message_stop`. `error` is not a Messages stop reason. A
+failed stream now terminates with a typed SSE error, without a normal message
+completion. Authentication, rate-limit, permission and timeout errors retain
+their classification; the HTTP timeout label is `timeout_error`.
+
+While a tool reply is buffered for validation, the stream emits a standard
+`ping` every 15 seconds. Message packets and heartbeats share a serialized
+writer. A failed write or flush cancels the upstream request, and supported
+HTTP writers receive a 10-second per-event write deadline. The heartbeat
+goroutine is stopped and joined before final events or handler return.
+
+These changes improve streaming failure semantics and connection liveness.
+They do not establish that a missing heartbeat caused the reported Desktop
+failures, or that a heartbeat can extend an upstream/client request timeout.
+
 ### A tool call appears as ordinary text
 
 Anthropic streaming clients dispatch on the JSON `type`, not just the SSE
@@ -72,6 +90,9 @@ history preserves the same transcript watermark. Uploads retain the real MIME
 type. A failed client attachment upload now returns an error instead of
 silently omitting the part. Explicit policy denial maps to a permission error;
 blocked or unchecked context cannot fall back to text chunks.
+The bridge's connection-recovery path also excludes attachment-policy errors,
+cancellation and deadlines, so it cannot replay a policy-denied/unchecked
+upload after the attachment layer has already stopped it.
 When an ordinary context upload failure uses chunk fallback, already delivered
 client attachments remain attached to the final answering turn.
 
@@ -128,6 +149,11 @@ text block boundaries, deterministic nested attachment references, and invalid
 result content. Attachment-policy tests verify that explicit denials override
 skip statuses, unchecked policy outcomes cannot use chunk fallback, and missing
 upload sessions cannot silently discard client attachments.
+Streaming regressions cover terminal failure events, shared HTTP/SSE error
+types, heartbeat shutdown, concurrent packet framing, and downstream write or
+flush failures cancelling the turn. Recovery tests cover wrapped attachment
+policy errors, cancellation and deadlines. These are local wire/lifecycle
+checks; no blocked request is replayed to test them.
 
 Live checks against a signed-in Quick account established:
 
@@ -161,6 +187,10 @@ Live checks against a signed-in Quick account established:
 - After the metadata-preservation adjustment, both the rebuilt candidate and
   deployed service passed a fresh streaming fixture Read/result/first-line
   loop. This checks the API tool round trip, not arbitrary old Desktop sessions.
+- The subsequent stream-lifecycle candidate returned `PONG` with `finish=stop`
+  through `-probe`; its candidate server and deployed service both passed the
+  streaming fixture loop. Heartbeats, write/flush failures and terminal SSE
+  errors are established by local lifecycle tests, not a new Desktop replay.
 
 For an installation check, build `./cmd/quick2api` and run
 `quick2api -config <your-config> -probe`. Use a proxy-owned outpost and a

@@ -303,7 +303,11 @@ func looksUUID(s string) bool {
 // retryable reports whether a Send failure is worth retrying on a fresh
 // connection — i.e. it died on the wire, not inside the model.
 func retryable(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var policy *chat.AttachmentPolicyError
+	if errors.As(err, &policy) {
 		return false
 	}
 	var ue *chat.UpstreamError
