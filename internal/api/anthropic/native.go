@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kilbertert/quick2api/internal/api/common"
@@ -23,21 +24,25 @@ import (
 )
 
 // NativeBridge owns upstream jobs across HTTP requests. Each job pins its
-// original request, catalog, upstream socket and account until completion. It
-// never resumes a pending tool by reseeding history or replaying a user message.
+// original request, catalog, upstream socket and account until completion.
+// Human questions explicitly end that job; only their validated real answers
+// start a new inference. Ordinary tool results always resume the same job.
 type NativeBridge struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	routes  map[string]*nativeTurn
-	pending map[string]*nativeTurn
-	active  map[string]*nativeTurn
-	seen    map[[32]byte]time.Time
-	wg      sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	mu          sync.Mutex
+	routes      map[string]*nativeTurn
+	pending     map[string]*nativeTurn
+	active      map[string]*nativeTurn
+	seen        map[[32]byte]time.Time
+	checkpoints map[string]nativeCheckpoint
+	wg          sync.WaitGroup
 	// run is injectable for local adapter/state tests, not simulated proof of
 	// Quick registration or tool behavior.
-	run func(context.Context, chat.TurnOpts) (*chat.TurnResult, error)
-	ttl time.Duration
+	run             func(context.Context, chat.TurnOpts) (*chat.TurnResult, error)
+	ttl             time.Duration
+	questionTTL     time.Duration
+	parkedQuestions int
 }
 
 type nativeTurn struct {
@@ -48,10 +53,20 @@ type nativeTurn struct {
 	conversation  string
 	messages      []Message
 	call          *toolbridge.Call
+	delivered     []ContentBlock
+	sessionKey    string
+	unsentContext bool
+	socketMu      sync.Mutex
+	discardSocket func()
 	relayMu       sync.Mutex
 	receipts      map[string]*nativeReceipt
 	receiptBytes  int
 	validateRelay func(string, json.RawMessage) error
+	parked        atomic.Bool
+	stopRun       context.CancelFunc
+	questionTimer *time.Timer // guarded by NativeBridge.mu
+	questionUntil time.Time   // guarded by NativeBridge.mu
+	requestKey    [32]byte
 }
 
 // Quick may deliver one invocation directly through MCP and later through its
@@ -65,6 +80,7 @@ type nativeReceipt struct {
 }
 
 var nativeInvocationID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+var errNativeExchangeExpired = errors.New("native tool exchange is unknown or expired; send a new user message to continue, and do not blindly repeat prior external actions")
 
 func (t *nativeTurn) relay(ctx context.Context, callID, name string, input json.RawMessage) (toolbridge.Result, error) {
 	if !nativeInvocationID.MatchString(callID) {
@@ -120,18 +136,33 @@ func NewNativeBridge(parent context.Context, ttl time.Duration, run func(context
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
-	return &NativeBridge{ctx: ctx, cancel: cancel, ttl: ttl, run: run, routes: make(map[string]*nativeTurn), pending: make(map[string]*nativeTurn), active: make(map[string]*nativeTurn), seen: make(map[[32]byte]time.Time)}
+	return &NativeBridge{ctx: ctx, cancel: cancel, ttl: ttl, questionTTL: 30 * time.Minute, run: run, routes: make(map[string]*nativeTurn), pending: make(map[string]*nativeTurn), active: make(map[string]*nativeTurn), seen: make(map[[32]byte]time.Time), checkpoints: make(map[string]nativeCheckpoint)}
 }
 
 func (b *NativeBridge) Close() {
 	b.cancel()
 	b.mu.Lock()
-	turns := make([]*nativeTurn, 0, len(b.routes))
+	turns := make(map[*nativeTurn]bool)
 	for _, t := range b.routes {
-		turns = append(turns, t)
+		turns[t] = true
 	}
+	for _, t := range b.pending {
+		turns[t] = true
+		if t.questionTimer != nil {
+			t.questionTimer.Stop()
+		}
+	}
+	for _, c := range b.checkpoints {
+		if c.discard != nil {
+			c.discard()
+		}
+	}
+	clear(b.pending)
+	clear(b.active)
+	clear(b.checkpoints)
+	b.parkedQuestions = 0
 	b.mu.Unlock()
-	for _, t := range turns {
+	for t := range turns {
 		t.exchange.Close()
 	}
 	b.wg.Wait()
@@ -307,23 +338,102 @@ func latestNativeResult(req *MessagesRequest) (*ContentBlock, error) {
 			}
 			found = &blocks[j]
 		}
-		if found != nil && len(blocks) != 1 {
-			return nil, errors.New("native continuation must contain only the pending tool result")
-		}
 		return found, nil
 	}
 	return nil, nil
 }
 
+// Desktop may merge an old question result and a newly submitted user message.
+// Only this explicit new-message shape can start after a lost question handle;
+// a result alone must never restart an expired job. Earlier actions stay history.
+func nativeQuestionFollowup(req *MessagesRequest, result *ContentBlock) bool {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "system" {
+			continue
+		}
+		var blocks []ContentBlock
+		if req.Messages[i].Role != "user" || json.Unmarshal(req.Messages[i].Content, &blocks) != nil || len(blocks) < 2 || blocks[0].Type != "tool_result" || blocks[0].ToolUseID != result.ToolUseID {
+			return false
+		}
+		hasText := false
+		for _, block := range blocks[1:] {
+			if block.Type != "text" {
+				return false
+			}
+			hasText = hasText || strings.TrimSpace(block.Text) != ""
+		}
+		if !hasText {
+			return false
+		}
+		for j := i - 1; j >= 0; j-- {
+			if req.Messages[j].Role == "system" {
+				continue
+			}
+			var calls []ContentBlock
+			if req.Messages[j].Role != "assistant" || json.Unmarshal(req.Messages[j].Content, &calls) != nil {
+				return false
+			}
+			// Native streaming may deliver narration before the question.
+			// Accept only that exact presentation shape: optional text followed
+			// by one matching question, with no other calls or content kinds.
+			if len(calls) == 2 && calls[0].Type == "text" {
+				calls = calls[1:]
+			}
+			if len(calls) != 1 || calls[0].Type != "tool_use" || calls[0].ID != result.ToolUseID || calls[0].Name != "AskUserQuestion" {
+				return false
+			}
+			catalog := common.NewClientTools(req.Tools, nil)
+			return catalog.ValidateCalls([]common.ToolCallJSON{{Type: "tool_use", Name: calls[0].Name, Input: calls[0].Input}}) == nil
+		}
+		return false
+	}
+	return false
+}
+
 func (b *NativeBridge) remove(t *nativeTurn) {
 	b.mu.Lock()
 	delete(b.routes, t.route)
-	for id, turn := range b.pending {
-		if turn == t {
-			delete(b.pending, id)
+	if !t.parked.Load() {
+		for id, turn := range b.pending {
+			if turn == t {
+				delete(b.pending, id)
+			}
 		}
 	}
 	b.mu.Unlock()
+}
+
+// A human question is an API turn boundary, not a five-minute device RPC.
+// Once its call is delivered, stop the upstream job without fabricating an
+// answer. Retain only the validated client transcript/handle for 30 minutes.
+// The actual answer starts a fresh inference with the complete real history;
+// no previously delivered tool is executed or automatically retried here.
+func (b *NativeBridge) parkQuestion(t *nativeTurn) {
+	b.mu.Lock()
+	if b.ctx.Err() != nil || b.pending[t.call.ID] != t || t.parked.Load() {
+		b.mu.Unlock()
+		return
+	}
+	t.parked.Store(true)
+	b.parkedQuestions++
+	delete(b.routes, t.route)
+	id := t.call.ID
+	t.questionUntil = time.Now().Add(b.questionTTL)
+	b.seen[t.requestKey] = t.questionUntil.Add(b.ttl)
+	t.questionTimer = time.AfterFunc(b.questionTTL, func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.pending[id] == t {
+			delete(b.pending, id)
+			b.parkedQuestions--
+			if b.active[t.conversation] == t {
+				delete(b.active, t.conversation)
+			}
+		}
+	})
+	b.mu.Unlock()
+	t.stopRun()
+	t.exchange.Close()
 }
 
 // open validates a continuation before consuming any result. Forks, expired
@@ -338,7 +448,14 @@ func (b *NativeBridge) open(req *MessagesRequest, conversation string, opts chat
 		t := b.pending[result.ToolUseID]
 		b.mu.Unlock()
 		if t == nil {
-			return nil, errors.New("native tool exchange is unknown or expired; it cannot be replayed")
+			if nativeQuestionFollowup(req, result) {
+				if _, err := nativeResultContent(result.Content); err != nil {
+					return nil, err
+				}
+				opts.Suffix = "\n\n[NEW CLIENT MESSAGE AFTER ENDED QUESTION]\nThe prior AskUserQuestion and its actual client result are completed history. The client appended new text after that result in its latest user message. Respond only to that new text; do not resume or repeat older external actions automatically. This is a fresh user submission, not a retry of the old Quick job."
+				return b.start(req, conversation, opts, nil)
+			}
+			return nil, errNativeExchangeExpired
 		}
 		if !t.mu.TryLock() {
 			return nil, errors.New("native tool exchange already has an active continuation")
@@ -349,6 +466,19 @@ func (b *NativeBridge) open(req *MessagesRequest, conversation string, opts chat
 				t.mu.Unlock()
 			}
 		}()
+		// Additional user content cannot be silently lost while resolving an
+		// ordinary same-job tool call. A live question consumes it through its
+		// validated new-inference boundary instead.
+		var resultBlocks []ContentBlock
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			if req.Messages[i].Role != "system" {
+				_ = json.Unmarshal(req.Messages[i].Content, &resultBlocks)
+				break
+			}
+		}
+		if len(resultBlocks) != 1 && !(t.parked.Load() && nativeQuestionFollowup(req, result)) {
+			return nil, errors.New("native continuation cannot append user content before its ordinary pending tool result")
+		}
 		if nativeIdentity(req) != t.identity || conversation != t.conversation {
 			return nil, errors.New("native tool continuation changed its session or tool contract")
 		}
@@ -359,6 +489,9 @@ func (b *NativeBridge) open(req *MessagesRequest, conversation string, opts chat
 		}
 		assistant := req.Messages[n]
 		want := []ContentBlock{{Type: "tool_use", ID: t.call.ID, Name: t.call.Name, Input: t.call.Input}}
+		if t.delivered != nil {
+			want = t.delivered
+		}
 		wantRaw, _ := json.Marshal(want)
 		assistantContent, normalizeErr := nativeContent(assistant.Content)
 		if assistant.Role != "assistant" || normalizeErr != nil || !canonicalEqual(assistantContent, json.RawMessage(wantRaw)) || req.Messages[n+1].Role != "user" {
@@ -373,18 +506,38 @@ func (b *NativeBridge) open(req *MessagesRequest, conversation string, opts chat
 		if err != nil {
 			return nil, err
 		}
+		if t.parked.Load() {
+			next, err := b.start(req, conversation, opts, t)
+			if err != nil {
+				return nil, err
+			}
+			t.mu.Unlock()
+			valid = true
+			return next, nil
+		}
 		if err = t.exchange.Resolve(toolbridge.Result{ID: result.ToolUseID, Content: content, IsError: result.IsError}); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, toolbridge.ErrClosed) || errors.Is(err, toolbridge.ErrCallCancelled) {
+				return nil, errNativeExchangeExpired
+			}
 			return nil, err
 		}
 		b.mu.Lock()
 		delete(b.pending, result.ToolUseID)
 		b.mu.Unlock()
 		t.messages = cloneMessages(req.Messages)
+		if len(req.Messages) > n+2 {
+			t.unsentContext = true
+		}
 		t.call = nil
+		t.delivered = nil
 		valid = true
 		return t, nil
 	}
+	return b.start(req, conversation, opts, nil)
+}
 
+func (b *NativeBridge) start(req *MessagesRequest, conversation string, opts chat.TurnOpts, replacing *nativeTurn) (*nativeTurn, error) {
+	boundaryNote := opts.Suffix
 	var nonce [32]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
@@ -404,20 +557,33 @@ func (b *NativeBridge) open(req *MessagesRequest, conversation string, opts chat
 	}{t.identity, conversation, t.messages})
 	requestData, _ = canonicalJSON(requestData)
 	requestKey := sha256.Sum256(requestData)
+	t.requestKey = requestKey
 	b.mu.Lock()
+	// Recheck and consume the parked handle under the admission lock: its
+	// timer may expire after open's lookup and transcript validation.
+	if replacing != nil && (b.pending[replacing.call.ID] != replacing || !replacing.parked.Load() || !time.Now().Before(replacing.questionUntil)) {
+		b.mu.Unlock()
+		t.mu.Unlock()
+		t.exchange.Close()
+		return nil, errNativeExchangeExpired
+	}
 	for key, until := range b.seen {
 		if time.Now().After(until) {
 			delete(b.seen, key)
 		}
 	}
 	_, duplicate := b.seen[requestKey]
-	if duplicate || (conversation != "" && b.active[conversation] != nil) || len(b.seen) >= 1024 {
+	if duplicate || (conversation != "" && b.active[conversation] != nil && b.active[conversation] != replacing) || len(b.seen) >= 1024 {
 		b.mu.Unlock()
 		t.mu.Unlock()
 		t.exchange.Close()
 		return nil, errors.New("native turn is already active or was recently submitted; no upstream request was replayed")
 	}
-	if len(b.routes) >= 32 {
+	count := len(b.routes) + b.parkedQuestions
+	if replacing != nil {
+		count--
+	}
+	if count >= 32 {
 		b.mu.Unlock()
 		t.mu.Unlock()
 		t.exchange.Close()
@@ -429,27 +595,73 @@ func (b *NativeBridge) open(req *MessagesRequest, conversation string, opts chat
 		t.exchange.Close()
 		return nil, b.ctx.Err()
 	}
+	if replacing != nil {
+		delete(b.pending, replacing.call.ID)
+		b.parkedQuestions--
+		if replacing.questionTimer != nil {
+			replacing.questionTimer.Stop()
+		}
+	}
+	// Only a delivered, fully completed response can authorize delta reuse.
+	// Human questions intentionally close their socket and never create one.
+	t.sessionKey = route[:8] + "-" + route[8:12] + "-" + route[12:16] + "-" + route[16:20] + "-" + route[20:32]
+	if replacing == nil {
+		if checkpoint, ok := b.checkpoints[conversation]; conversation != "" && ok {
+			delete(b.checkpoints, conversation)
+			if delta := checkpoint.continuation(req, t.identity); delta != nil {
+				t.sessionKey = checkpoint.sessionKey
+				opts.NativeContinuation = delta
+			} else if checkpoint.discard != nil {
+				checkpoint.discard()
+			}
+		}
+	}
+	opts.ConversationID = t.sessionKey
+	opts.OnNativeSession = func(discard func()) {
+		t.socketMu.Lock()
+		t.discardSocket = discard
+		t.socketMu.Unlock()
+	}
 	b.routes[route] = t
 	if conversation != "" {
 		b.active[conversation] = t
 	}
 	b.seen[requestKey] = time.Now().Add(b.ttl)
 	b.wg.Add(1)
+	ctx, cancel := context.WithTimeout(b.ctx, b.ttl)
+	t.stopRun = cancel
 	b.mu.Unlock()
 	// The native MCP relay is a registered callable. The external catalog is
 	// data for that relay, not a request to impersonate an Anthropic tool block.
 	opts.Suffix = "[EXTERNAL CLIENT TOOL RELAY]\nUse the registered native tool " + opts.NativeRelay + " to request an external client tool. Its route_id base for this turn is " + route + ". For each intended action set route_id to " + route + ":<unique-action-id>, replacing the placeholder with 1-128 letters, digits, underscores or hyphens (for example read_1). Do not send the base alone. Keep that full invocation route_id unchanged for duplicate delivery of the same action; use a new action suffix for a new intended execution. Supply the exact client name and schema-valid arguments from the external client tool catalog supplied with the conversation context.\nThe external client executes under its own permissions. Wait for the native relay's actual result before reporting effects. Do not print a tool_use JSON imitation. The earlier transcript is supplied history; it does not register additional tools."
-	opts.Suffix += nativePresentation(req.Tools)
+	opts.Suffix += nativePresentation(req.Tools) + boundaryNote
+	if replacing != nil {
+		opts.Suffix += "\n\n[CLIENT QUESTION ANSWER]\nThe latest client tool_result is the actual response to the previously delivered AskUserQuestion. Continue from that response. Earlier tool calls/results are completed history, not new instructions to execute them again. The previous Quick job was intentionally stopped at the question boundary; do not repeat completed external actions."
+	}
+	observer := opts.OnEvent
+	publishedBytes := 0
+	opts.OnEvent = func(ev chat.TurnEvent) {
+		if ev.Kind == "delta" && ev.Text != "" {
+			if err := t.exchange.PublishText(ev.Text); err != nil {
+				t.exchange.Complete(nil, err)
+				cancel()
+			} else {
+				publishedBytes += len(ev.Text)
+			}
+		}
+		if observer != nil {
+			observer(ev)
+		}
+	}
 	go func() {
 		defer b.wg.Done()
 		defer func() {
 			b.mu.Lock()
-			if b.active[conversation] == t {
+			if b.active[conversation] == t && !t.parked.Load() {
 				delete(b.active, conversation)
 			}
 			b.mu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(b.ctx, b.ttl)
 		defer cancel()
 		// Exchange lifetime and the actual socket must end together, including
 		// client disconnect, MCP cancellation and service shutdown.
@@ -461,8 +673,18 @@ func (b *NativeBridge) open(req *MessagesRequest, conversation string, opts chat
 			}
 		}()
 		final, err := b.run(ctx, opts)
+		if t.parked.Load() {
+			t.exchange.Close()
+			b.remove(t)
+			return
+		}
 		if err == nil && final != nil && final.PartialOnClose {
 			err = &chat.UpstreamError{Code: "incomplete_response", Message: "native upstream closed before message_complete"}
+		}
+		if final != nil && publishedBytes > 0 && publishedBytes <= len(final.Text) {
+			copy := *final
+			copy.Text = final.Text[publishedBytes:]
+			final = &copy
 		}
 		t.exchange.Complete(final, err)
 		<-t.exchange.Done()
@@ -550,6 +772,7 @@ func (b *NativeBridge) Relay(w http.ResponseWriter, r *http.Request) {
 	}
 	route, callID, hasID := strings.Cut(call.Route, ":")
 	if !hasID || !nativeInvocationID.MatchString(callID) {
+		slog.Warn("native relay call rejected", "stage", "invocation_suffix")
 		http.Error(w, "route_id must include its invocation suffix", http.StatusBadRequest)
 		return
 	}
@@ -557,11 +780,15 @@ func (b *NativeBridge) Relay(w http.ResponseWriter, r *http.Request) {
 	t := b.routes[route]
 	b.mu.Unlock()
 	if t == nil {
+		slog.Warn("native relay call rejected", "stage", "route_lookup")
 		http.Error(w, "relay turn is unknown or expired", http.StatusConflict)
 		return
 	}
 	result, err := t.relay(r.Context(), callID, call.Name, call.Input)
 	if err != nil {
+		// Validation and exchange errors never include input values. Keep the
+		// private route, call arguments and tool result out of diagnostics.
+		slog.Warn("native relay call failed", "stage", "client_exchange", "reason", err.Error())
 		if r.Context().Err() != nil {
 			t.exchange.Close()
 			b.remove(t)
@@ -577,7 +804,50 @@ func (b *NativeBridge) Relay(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, model, conversation, text, tail, final string, atts []chat.Attachment, req *MessagesRequest) {
+	started := time.Now()
+	firstText, firstThinking := false, false
 	opts := chat.TurnOpts{Text: text, Tail: tail, Final: final, AgentMode: h.Cfg.AgentModeFor(model), ThinkingEffort: h.Cfg.Quick.ThinkingEffort, UserTimezone: h.Cfg.Quick.UserTimezone, UserLocale: h.Cfg.Quick.UserLocale, NativeRelay: h.Cfg.Tools.NativeRelayName, Title: "quick2api native client relay"}
+	// Metadata-only evidence distinguishes a real failed invocation from a
+	// model merely saying it failed. Do not log frame bodies or transcripts.
+	opts.OnEvent = func(ev chat.TurnEvent) {
+		if (ev.Kind == "delta" && !firstText) || (ev.Kind == "thinking" && !firstThinking) {
+			if ev.Kind == "delta" {
+				firstText = true
+			} else {
+				firstThinking = true
+			}
+			slog.Info("native first output", "request_id", reqID, "kind", ev.Kind, "elapsed_ms", time.Since(started).Milliseconds())
+		}
+		if ev.Kind == "stage" {
+			slog.Info("native preparation stage", "request_id", reqID, "stage", ev.Text, "elapsed_ms", time.Since(started).Milliseconds())
+		}
+		if ev.Kind != "frame" || ev.Frame == nil {
+			return
+		}
+		switch ev.Frame.Type {
+		case "guardrail_blocked":
+			slog.Info("native upstream termination", "request_id", reqID, "kind", "content_filter", "elapsed_ms", time.Since(started).Milliseconds())
+		case "error":
+			var failure struct {
+				Code      string `json:"code"`
+				ErrorCode string `json:"error_code"`
+			}
+			_ = json.Unmarshal(ev.Frame.Payload, &failure)
+			if failure.Code == "content_filtered" || failure.ErrorCode == "content_filtered" {
+				slog.Info("native upstream termination", "request_id", reqID, "kind", "content_filter", "elapsed_ms", time.Since(started).Milliseconds())
+			}
+		case "tool_call":
+			var call chat.NativeCall
+			if json.Unmarshal(ev.Frame.Payload, &call) != nil {
+				return
+			}
+			var envelope map[string]json.RawMessage
+			_ = json.Unmarshal(call.Arguments, &envelope)
+			slog.Info("native upstream device invocation", "request_id", reqID, "configured_relay", call.Name == opts.NativeRelay, "params_envelope", len(envelope["params"]) > 0)
+		case "tool_start", "tool_error":
+			slog.Info("native upstream tool boundary", "request_id", reqID, "event", ev.Frame.Type)
+		}
+	}
 	if len(req.Thinking) > 0 {
 		var thinking struct {
 			Type string `json:"type"`
@@ -592,17 +862,28 @@ func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, mod
 		// These validation errors describe the contract, never the private
 		// route token, transcript contents, authorization headers or tool input.
 		slog.Warn("native client continuation rejected", "request_id", reqID, "reason", err.Error())
-		writeErr(w, http.StatusConflict, "invalid_request_error", err.Error())
+		w.Header().Set("x-should-retry", "false")
+		// Some intermediate proxies discard x-should-retry. Contract failures
+		// also use 400 so SDKs cannot treat them as retryable 409 conflicts.
+		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	defer t.mu.Unlock()
 	// A returned tool_use is the deliberate detach point. Other exits abort
 	// the job; an upstream operation never outlives an undelivered response.
 	detached := false
+	deliveredFinal := false
 	defer func() {
 		if !detached {
 			t.exchange.Close()
 			h.Native.remove(t)
+			if !deliveredFinal {
+				t.socketMu.Lock()
+				if t.discardSocket != nil {
+					t.discardSocket()
+				}
+				t.socketMu.Unlock()
+			}
 		}
 	}()
 	ctx, cancel := context.WithTimeout(r.Context(), h.Cfg.TurnTimeout())
@@ -625,7 +906,34 @@ func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, mod
 		stopKeepalive = stream.startKeepalive(ctx, streamPingInterval)
 		defer stopKeepalive()
 	}
-	ev, err := t.exchange.Next(ctx)
+	var progress strings.Builder
+	textOpen := false
+	appendText := func(text string) bool {
+		if text == "" {
+			return true
+		}
+		progress.WriteString(text)
+		if stream == nil {
+			return true
+		}
+		if !textOpen {
+			if !stream.emit("content_block_start", map[string]any{"index": 0, "content_block": map[string]any{"type": "text", "text": ""}}) {
+				return false
+			}
+			textOpen = true
+		}
+		return stream.emit("content_block_delta", map[string]any{"index": 0, "delta": map[string]any{"type": "text_delta", "text": text}})
+	}
+	var ev toolbridge.Event
+	for {
+		ev, err = t.exchange.Next(ctx)
+		if err != nil || ev.Err != nil || ev.Call != nil || ev.Final != nil {
+			break
+		}
+		if !appendText(ev.Text) {
+			return
+		}
+	}
 	if err == nil {
 		err = ev.Err
 	}
@@ -646,7 +954,11 @@ func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, mod
 	var usage anthropicUsage
 	if ev.Call != nil {
 		t.call = ev.Call
-		content = []ContentBlock{{Type: "tool_use", ID: ev.Call.ID, Name: ev.Call.Name, Input: ev.Call.Input}}
+		if progress.Len() > 0 {
+			content = append(content, ContentBlock{Type: "text", Text: progress.String()})
+		}
+		content = append(content, ContentBlock{Type: "tool_use", ID: ev.Call.ID, Name: ev.Call.Name, Input: ev.Call.Input})
+		t.delivered = content
 		stop = "tool_use"
 		h.Native.mu.Lock()
 		select {
@@ -667,7 +979,10 @@ func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, mod
 			writeErr(w, 502, "api_error", "native turn completed without a result")
 			return
 		}
-		content = []ContentBlock{{Type: "text", Text: ev.Final.Text}}
+		if !appendText(ev.Final.Text) {
+			return
+		}
+		content = []ContentBlock{{Type: "text", Text: progress.String()}}
 		stop = "end_turn"
 		if ev.Final.FinishReason == "content_filter" {
 			stop = "refusal"
@@ -681,7 +996,13 @@ func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, mod
 			return
 		}
 	} else {
+		if textOpen && !stream.emit("content_block_stop", map[string]any{"index": 0}) {
+			return
+		}
 		for i, block := range content {
+			if block.Type == "text" && textOpen {
+				continue
+			}
 			start := block
 			if block.Type == "tool_use" {
 				start.Input = json.RawMessage(`{}`)
@@ -705,5 +1026,20 @@ func (h *Handler) serveNative(w http.ResponseWriter, r *http.Request, reqID, mod
 			return
 		}
 	}
+	if ev.Call != nil && ev.Call.Name == "AskUserQuestion" {
+		h.Native.parkQuestion(t)
+	}
+	if ev.Call == nil {
+		remembered := stop == "end_turn" && h.Native.remember(t, content)
+		if !remembered {
+			t.socketMu.Lock()
+			if t.discardSocket != nil {
+				t.discardSocket()
+			}
+			t.socketMu.Unlock()
+		}
+	}
+	deliveredFinal = ev.Call == nil
+	slog.Info("native response delivered", "request_id", reqID, "stop_reason", stop, "elapsed_ms", time.Since(started).Milliseconds())
 	detached = ev.Call != nil
 }

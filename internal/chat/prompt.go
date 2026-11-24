@@ -37,6 +37,7 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 			return nil, err
 		}
 		t.native = runtime
+		t.emit(TurnEvent{Kind: "stage", Text: "relay_ready"})
 		defer runtime.client.CloseIdleConnections()
 		runtime.deviceFields["surfaceType"] = c.SurfaceType
 		runtime.deviceFields["appVersion"] = orElse(c.AppVersion, "1.2.4660")
@@ -111,7 +112,9 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 				}
 			}
 		}
+		t.emit(TurnEvent{Kind: "stage", Text: "context_upload_started"})
 		path, attID, err := uploadAttachment(ctx, sess, conversationID, ctxName, "text/plain", ctxData)
+		t.emit(TurnEvent{Kind: "stage", Text: "context_upload_finished"})
 		slog.Debug("sendPrompt upload attempt", "path", path, "attID", attID, "err", err)
 		if err == nil && path != "" {
 			wireAtts = append(wireAtts, map[string]any{
@@ -210,6 +213,7 @@ func sendUserMessage(t *turn, conversationID, text string, opts TurnOpts, attach
 	if err := t.send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
 		return fmt.Errorf("send user_message: %w", err)
 	}
+	t.emit(TurnEvent{Kind: "stage", Text: "user_message_sent"})
 	return nil
 }
 

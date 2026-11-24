@@ -245,6 +245,14 @@ func (cn *Conn) Alive() bool { return !cn.dead.Load() }
 // ConversationID returns the upstream session_id/thread_id of this conn.
 func (cn *Conn) ConversationID() string { return cn.convID }
 
+// MatchesSession permits token refresh, but never moves an existing native
+// thread to another account, device, tenant or transport endpoint.
+func (cn *Conn) MatchesSession(s *session.Session) bool {
+	return cn.sess != nil && s != nil && cn.sess.ActorARN == s.ActorARN &&
+		cn.sess.AWSAccountID == s.AWSAccountID && cn.sess.WSHost == s.WSHost &&
+		cn.sess.OutpostID == s.OutpostID && cn.sess.TenantURL == s.TenantURL
+}
+
 // Close shuts the underlying socket.
 func (cn *Conn) Close() {
 	cn.dead.Store(true)
@@ -283,6 +291,12 @@ func (cn *Conn) Send(ctx context.Context, sess *session.Session, opts TurnOpts) 
 	cn.t.emit = func(ev TurnEvent) {
 		if opts.OnEvent != nil {
 			opts.OnEvent(ev)
+		}
+	}
+	if opts.NativeRelay != "" {
+		if !cn.MatchesSession(sess) {
+			cn.Close()
+			return nil, errors.New("native connection session identity changed")
 		}
 	}
 	head := transcriptHead(opts)

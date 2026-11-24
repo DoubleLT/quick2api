@@ -45,6 +45,8 @@ type Bridge struct {
 type connEntry struct {
 	conn   *chat.Conn
 	lastAt time.Time
+	busy   bool
+	native bool
 }
 
 // New prepares the session source. It eagerly verifies the source once so a
@@ -140,6 +142,9 @@ func (b *Bridge) sweepOnce() {
 	defer b.mu.Unlock()
 	// Idle TTL first.
 	for k, e := range b.conns {
+		if e.busy {
+			continue
+		}
 		if now.Sub(e.lastAt) > idle {
 			e.conn.Close()
 			delete(b.conns, k)
@@ -150,9 +155,15 @@ func (b *Bridge) sweepOnce() {
 		var oldestKey string
 		var oldest time.Time
 		for k, e := range b.conns {
+			if e.busy {
+				continue
+			}
 			if oldestKey == "" || e.lastAt.Before(oldest) {
 				oldestKey, oldest = k, e.lastAt
 			}
+		}
+		if oldestKey == "" {
+			break
 		}
 		e := b.conns[oldestKey]
 		e.conn.Close()
@@ -225,11 +236,7 @@ func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnRes
 		return nil, err
 	}
 	if opts.NativeRelay != "" {
-		// A native exchange owns this socket until completion, including all
-		// client-result waits. It is never pooled, swept, replayed or moved to
-		// a different lane after a tool may have been executed.
-		opts.ConversationID = ""
-		return b.ChatClient().RunTurn(ctx, sess, opts)
+		return b.sendNative(ctx, sess, opts)
 	}
 
 	// Session reuse: keep one live conversation per client ConversationID.

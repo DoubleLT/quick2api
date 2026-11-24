@@ -182,6 +182,12 @@ func nativeToolFixture(t *testing.T, count int, ttl time.Duration, name string, 
 	var runs atomic.Int32
 	b := NewNativeBridge(context.Background(), ttl, func(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
 		runs.Add(1)
+		if name == "AskUserQuestion" && strings.Contains(opts.Text, `"tool_result"`) {
+			if !strings.Contains(opts.Text, resultText) {
+				return nil, errors.New("real question answer missing from resumed history")
+			}
+			return &chat.TurnResult{Text: "All local fixture results received", FinishReason: "stop"}, nil
+		}
 		if opts.NativeRelay != "quick2api_client_call" {
 			return nil, errors.New("missing native relay option")
 		}
@@ -239,25 +245,166 @@ func nativeToolFixture(t *testing.T, count int, ttl time.Duration, name string, 
 	return h, &runs
 }
 
-func TestNativeQuestionWaitsForActualClientAnswer(t *testing.T) {
+func TestNativeQuestionParksUpstreamUntilActualClientAnswer(t *testing.T) {
+	h, runs, req, first := nativeQuestionFixture(t, 250*time.Millisecond, time.Minute)
+	// Wait beyond the entire execution budget. The real question answer must
+	// remain resumable without keeping the old upstream job/socket alive.
+	time.Sleep(350 * time.Millisecond)
+	h.Native.mu.Lock()
+	turn := h.Native.pending[first.Content[0].ID]
+	parked := h.Native.parkedQuestions
+	routes := len(h.Native.routes)
+	h.Native.mu.Unlock()
+	if turn == nil || parked != 1 || routes != 0 {
+		t.Fatal("human wait did not survive the execution deadline")
+	}
+	select {
+	case <-turn.exchange.Done():
+	default:
+		t.Fatal("human wait retained the old upstream exchange")
+	}
+	assistant, _ := json.Marshal(first.Content)
+	result, _ := json.Marshal([]ContentBlock{{Type: "tool_result", ToolUseID: first.Content[0].ID, Content: json.RawMessage(`"Blue"`)}})
+	req.Messages = append(req.Messages, Message{Role: "assistant", Content: assistant}, Message{Role: "user", Content: result})
+	altered := req
+	altered.Tools = json.RawMessage(nativeCatalog)
+	if w := nativeHTTP(t, h, altered, "question-session"); w.Code != 400 || runs.Load() != 1 {
+		t.Fatal("changed question contract was accepted")
+	}
+	last := nativeReply(t, nativeHTTP(t, h, req, "question-session"))
+	if last.StopReason != "end_turn" || runs.Load() != 2 || last.Content[0].Text != "All local fixture results received" {
+		t.Fatal("actual question answer did not start exactly one answer continuation")
+	}
+	if w := nativeHTTP(t, h, req, "question-session"); w.Code != 400 || w.Header().Get("x-should-retry") != "false" || runs.Load() != 2 {
+		t.Fatal("duplicate question answer started another inference")
+	}
+}
+
+func nativeQuestionFixture(t *testing.T, ttl, questionTTL time.Duration) (*Handler, *atomic.Int32, MessagesRequest, anthropicMessage) {
+	t.Helper()
 	input := json.RawMessage(`{"questions":[{"question":"Which color?","header":"Color","multiSelect":false,"options":[{"label":"Blue","description":"Use blue"},{"label":"Green","description":"Use green"}]}]}`)
-	h, runs := nativeToolFixture(t, 1, time.Minute, "AskUserQuestion", input, "Blue")
+	h, runs := nativeToolFixture(t, 1, ttl, "AskUserQuestion", input, "Blue")
+	h.Native.questionTTL = questionTTL
 	req := nativeRequest()
 	req.Tools = json.RawMessage(`[{"name":"AskUserQuestion","description":"Ask only for a decision that belongs to the user","input_schema":{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"multiSelect":{"type":"boolean"},"options":{"type":"array","minItems":2,"items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label","description"],"additionalProperties":false}}},"required":["question","header","multiSelect","options"],"additionalProperties":false}}},"required":["questions"],"additionalProperties":false}}]`)
 	first := nativeReply(t, nativeHTTP(t, h, req, "question-session"))
 	if first.StopReason != "tool_use" || len(first.Content) != 1 || first.Content[0].Name != "AskUserQuestion" || !canonicalEqual(first.Content[0].Input, input) {
 		t.Fatal("question was not delivered as the exact declared client tool call")
 	}
-	if runs.Load() != 1 || len(h.Native.pending) != 1 {
+	h.Native.mu.Lock()
+	pending := len(h.Native.pending)
+	h.Native.mu.Unlock()
+	if runs.Load() != 1 || pending != 1 {
 		t.Fatal("question did not remain pending for the client's answer")
 	}
-	assistant, _ := json.Marshal(first.Content)
-	result, _ := json.Marshal([]ContentBlock{{Type: "tool_result", ToolUseID: first.Content[0].ID, Content: json.RawMessage(`"Blue"`)}})
-	req.Messages = append(req.Messages, Message{Role: "assistant", Content: assistant}, Message{Role: "user", Content: result})
-	last := nativeReply(t, nativeHTTP(t, h, req, "question-session"))
-	if last.StopReason != "end_turn" || runs.Load() != 1 || last.Content[0].Text != "All local fixture results received" {
-		t.Fatal("actual question answer did not resume the same job")
+	return h, runs, req, first
+}
+
+func TestNativeQuestionExpiryAndShutdownReleaseParkedState(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		t.Run(fmt.Sprint("shutdown=", shutdown), func(t *testing.T) {
+			h, runs, req, first := nativeQuestionFixture(t, time.Minute, 75*time.Millisecond)
+			if shutdown {
+				h.Native.Close()
+			} else {
+				time.Sleep(125 * time.Millisecond)
+			}
+			h.Native.mu.Lock()
+			leaked := len(h.Native.routes)+len(h.Native.pending)+len(h.Native.active)+h.Native.parkedQuestions != 0
+			h.Native.mu.Unlock()
+			if leaked {
+				t.Fatal("expired or closed question retained bridge state")
+			}
+			if w := nativeHTTP(t, h, continueNative(t, req, first, false), "question-session"); w.Code != 400 || w.Header().Get("x-should-retry") != "false" || runs.Load() != 1 {
+				t.Fatal("expired question restarted inference")
+			}
+		})
 	}
+}
+
+func TestNativeQuestionAdmissionRechecksDeadlineAndProtectsOriginalRequest(t *testing.T) {
+	h, runs, req, first := nativeQuestionFixture(t, time.Minute, time.Minute)
+	h.Native.mu.Lock()
+	turn := h.Native.pending[first.Content[0].ID]
+	// Even anonymous requests must retain their original receipt throughout
+	// a human wait, after the original execution receipt would have expired.
+	if !h.Native.seen[turn.requestKey].After(turn.questionUntil) {
+		t.Fatal("question lost original request duplicate protection")
+	}
+	// Simulate validation finishing after deadline but before timer cleanup.
+	turn.questionUntil = time.Now().Add(-time.Second)
+	h.Native.mu.Unlock()
+	if _, err := h.Native.start(&req, "question-session", chat.TurnOpts{}, turn); !errors.Is(err, errNativeExchangeExpired) || runs.Load() != 1 {
+		t.Fatal("expired question admitted during timer race")
+	}
+}
+
+func TestNativeNewTextAfterEndedQuestionIsFreshSubmission(t *testing.T) {
+	old, _, initial, first := nativeQuestionFixture(t, time.Minute, time.Minute)
+	old.Native.Close() // The new bridge has no retained handle after restart.
+	req := continueNative(t, initial, first, false)
+	result := ContentBlock{Type: "tool_result", ToolUseID: first.Content[0].ID, Content: json.RawMessage(`"Blue"`)}
+	req.Messages[len(req.Messages)-1].Content, _ = json.Marshal([]ContentBlock{result, {Type: "text", Text: "Ask a fresh harmless color question; do nothing else"}})
+	req.Messages = append(req.Messages, Message{Role: "system", Content: json.RawMessage(`"client runtime metadata"`)})
+	var runs atomic.Int32
+	b := NewNativeBridge(context.Background(), time.Minute, func(_ context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
+		runs.Add(1)
+		if !strings.Contains(opts.Text, "fresh harmless color question") || !strings.Contains(opts.Text, `"Blue"`) || !strings.Contains(opts.Suffix, "NEW CLIENT MESSAGE AFTER ENDED QUESTION") {
+			return nil, errors.New("fresh message, actual prior result or question boundary missing")
+		}
+		return &chat.TurnResult{Text: "Fresh request received", FinishReason: "stop"}, nil
+	})
+	defer b.Close()
+	cfg := config.Defaults()
+	cfg.Tools.NativeRelayName = "quick2api_client_call"
+	h := &Handler{Cfg: cfg, Native: b}
+	for _, change := range []string{"result-only", "wrong-id", "ordinary-tool", "empty-text", "image", "two-results"} {
+		t.Run(change, func(t *testing.T) {
+			bad := req
+			bad.Messages = cloneMessages(req.Messages)
+			blocks := []ContentBlock{result, {Type: "text", Text: "new message"}}
+			switch change {
+			case "result-only":
+				blocks = blocks[:1]
+			case "wrong-id":
+				blocks[0].ToolUseID = "toolu_q2a_unknown"
+			case "ordinary-tool":
+				bad.Messages[len(bad.Messages)-3].Content, _ = json.Marshal([]ContentBlock{{Type: "tool_use", ID: result.ToolUseID, Name: "Read", Input: json.RawMessage(nativeInput)}})
+			case "empty-text":
+				blocks[1].Text = "  "
+			case "image":
+				blocks[1] = ContentBlock{Type: "image"}
+			case "two-results":
+				blocks = append(blocks, result)
+			}
+			bad.Messages[len(bad.Messages)-2].Content, _ = json.Marshal(blocks)
+			if w := nativeHTTP(t, h, bad, "question-session"); w.Code != 400 || runs.Load() != 0 {
+				t.Fatal("invalid ended-question recovery started inference or enabled retry")
+			}
+		})
+	}
+	got := nativeReply(t, nativeHTTP(t, h, req, "question-session"))
+	if got.StopReason != "end_turn" || runs.Load() != 1 {
+		t.Fatal("explicit new message after ended question was not accepted")
+	}
+	if w := nativeHTTP(t, h, req, "question-session"); w.Code != 400 || runs.Load() != 1 {
+		t.Fatal("merged new-message retry started a second inference")
+	}
+}
+
+func TestNativeOrdinaryContinuationCannotSilentlyDiscardNewText(t *testing.T) {
+	h, runs := nativeFixture(t, 1, time.Minute)
+	req := nativeRequest()
+	first := nativeReply(t, nativeHTTP(t, h, req, "fixture-session"))
+	next := continueNative(t, req, first, false)
+	var blocks []ContentBlock
+	_ = json.Unmarshal(next.Messages[len(next.Messages)-1].Content, &blocks)
+	blocks = append(blocks, ContentBlock{Type: "text", Text: "new task"})
+	next.Messages[len(next.Messages)-1].Content, _ = json.Marshal(blocks)
+	if w := nativeHTTP(t, h, next, "fixture-session"); w.Code != 400 || runs.Load() != 1 {
+		t.Fatal("ordinary tool silently lost appended new task")
+	}
+	_ = nativeReply(t, nativeHTTP(t, h, continueNative(t, req, first, false), "fixture-session"))
 }
 
 func TestNativeLiteralDecisionExampleRemainsText(t *testing.T) {
@@ -294,7 +441,7 @@ func TestNativeHTTPPauseResumeKeepsOneJob(t *testing.T) {
 			if message.StopReason != "end_turn" || message.Content[0].Text != "All local fixture results received" || runs.Load() != 1 {
 				t.Fatalf("resume started new inference: message=%+v runs=%d", message, runs.Load())
 			}
-			if got := nativeHTTP(t, h, req, "fixture-session"); got.Code != 409 {
+			if got := nativeHTTP(t, h, req, "fixture-session"); got.Code != 400 || got.Header().Get("x-should-retry") != "false" {
 				t.Fatal("duplicate result was accepted")
 			}
 		})
@@ -328,7 +475,7 @@ func TestNativeRejectsDivergentContinuationWithoutConsuming(t *testing.T) {
 			case "session":
 				session = "fork"
 			}
-			if w := nativeHTTP(t, h, changed, session); w.Code != 409 {
+			if w := nativeHTTP(t, h, changed, session); w.Code != 400 {
 				t.Fatalf("changed %s returned %d: %s", change, w.Code, w.Body.String())
 			}
 		})
@@ -376,11 +523,11 @@ func TestNativeInitialDuplicateIsNotReplayed(t *testing.T) {
 			h, runs := nativeFixture(t, 1, time.Minute)
 			req := nativeRequest()
 			first := nativeReply(t, nativeHTTP(t, h, req, session))
-			if w := nativeHTTP(t, h, req, session); w.Code != 409 {
+			if w := nativeHTTP(t, h, req, session); w.Code != 400 {
 				t.Fatal("active initial request replayed")
 			}
 			_ = nativeReply(t, nativeHTTP(t, h, continueNative(t, req, first, false), session))
-			if w := nativeHTTP(t, h, req, session); w.Code != 409 || runs.Load() != 1 {
+			if w := nativeHTTP(t, h, req, session); w.Code != 400 || runs.Load() != 1 {
 				t.Fatal("completed initial request replayed")
 			}
 		})
@@ -453,7 +600,7 @@ func TestNativeExpiryAndShutdownReleasePendingJobs(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("expired native job remained live")
 	}
-	if w := nativeHTTP(t, h, continueNative(t, req, first, false), "fixture-session"); w.Code != 409 || runs.Load() != 1 {
+	if w := nativeHTTP(t, h, continueNative(t, req, first, false), "fixture-session"); w.Code != 400 || w.Header().Get("x-should-retry") != "false" || runs.Load() != 1 {
 		t.Fatal("expired continuation started a fresh job")
 	}
 	h.Native.Close()

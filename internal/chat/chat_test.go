@@ -4,10 +4,39 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/kilbertert/quick2api/internal/session"
 	"strings"
 	"testing"
 	"unicode/utf8"
 )
+
+func TestNativeSessionBindingAllowsOnlySameIdentityRefresh(t *testing.T) {
+	original := &session.Session{ActorARN: "actor-a", AWSAccountID: "account-a", WSHost: "host-a", OutpostID: "device-a", TenantURL: "tenant-a", IDToken: "old-local-fixture-token"}
+	cn := &Conn{sess: original}
+	refreshed := *original
+	refreshed.IDToken = "refreshed-local-fixture-token"
+	if !cn.MatchesSession(&refreshed) {
+		t.Fatal("same identity token refresh rejected")
+	}
+	for _, field := range []string{"actor", "account", "host", "device", "tenant"} {
+		changed := refreshed
+		switch field {
+		case "actor":
+			changed.ActorARN = "other"
+		case "account":
+			changed.AWSAccountID = "other"
+		case "host":
+			changed.WSHost = "other"
+		case "device":
+			changed.OutpostID = "other"
+		case "tenant":
+			changed.TenantURL = "other"
+		}
+		if cn.MatchesSession(&changed) {
+			t.Fatalf("native thread accepted changed %s", field)
+		}
+	}
+}
 
 func TestCollectNativeToolProgressBeforeClientToolReply(t *testing.T) {
 	// Recorded event ordering: narration, two native attachment reads, then

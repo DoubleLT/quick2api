@@ -45,15 +45,26 @@ that schema cached.
 4. Desktop executes under its own permissions. Its next Messages request carries
    the real `tool_result`; the proxy validates the original session, system,
    model, tool catalog, call arguments and append-only history before consuming it.
-5. The callback returns that result, the same native tool call completes, and
+5. For ordinary tools, the callback returns that result, the same native tool call completes, and
    the same Quick job continues. No new upstream prompt or inference is started
    for this continuation.
 
+`AskUserQuestion` is an explicit human boundary. After successfully delivering
+the question, the proxy stops the upstream job/socket and retains the exact
+question and transcript contract for 30 minutes from delivery. It does not
+fabricate a tool answer. The real client answer must pass the same session,
+catalog and append-only history validation; it consumes the pending handle
+atomically and starts one new inference with the complete actual transcript.
+Earlier tools remain completed history and are not automatically reexecuted.
+This exception avoids spending the model execution deadline while a human is
+answering. It does not change ordinary Read/Bash tool continuations.
+
 The HTTP concurrency slot is released while Desktop works. There are at most
-32 active native jobs and 32 pending calls per job. Calls are delivered one at a
+32 active jobs and parked questions combined, and 32 pending calls per job. Calls are delivered one at a
 time to Anthropic clients. The overall job deadline defaults to 300 seconds and
 cannot be configured above the courier's 300-second call budget. This is an
-overall deadline, not an idle timeout refreshed after each tool result.
+overall execution deadline, not an idle timeout refreshed after each tool
+result. A parked human question has its own 30-minute answer deadline.
 
 ## Build and prepare
 
@@ -128,17 +139,35 @@ itself. The MCP stdio implementation uses protocol version `2024-11-05`.
   unknown-length input and trailing whitespace. History is not trimmed to fit.
   This HTTP input limit does not raise the separate per-tool/result budgets.
 - No replay, alternate-account retry, prompt fallback, or chunk fallback in
-  native jobs. Policy denial and content filtering remain failures/refusals.
+  native jobs. Only an explicit, validated human answer starts a new inference
+  at the question boundary described above. Policy denial and content filtering
+  remain failures/refusals.
 - New submissions for an active named conversation are rejected. An identical
   initial request is also rejected for one job lifetime, including after
   completion; a bounded 1,024-entry receipt cache fails closed when full.
   This is bounded duplicate protection, not a distributed exactly-once promise.
+  An initial request that parks a question retains its receipt throughout the
+  answer window and one execution lifetime afterward, including anonymous
+  conversations.
 - Forked, compacted or changed pending transcripts are rejected. There is no
   pending-job recovery across proxy restart. The user must not rerun potentially
   completed external actions blindly after an interrupted result delivery.
   Equivalent text string/block representations and moved content-block
   `cache_control` hints are normalized during continuation matching; actual
   content and tool inputs remain exact.
+  Continuation validation failures return HTTP 400 and `x-should-retry: false`,
+  so intermediate proxies discarding that header cannot create an SDK 409
+  retry loop. Expired handles cannot be restored by resending a result alone.
+  Desktop can merge an ended question's result with newly submitted text in
+  one user message. That explicit new submission is accepted when it contains
+  one result followed only by nonempty text and the preceding assistant message
+  is its matching, schema-valid AskUserQuestion. The complete real transcript
+  is retained; a fresh inference is instructed to answer the new text and leave
+  older actions as history. Initial-request receipts also protect this shape
+  from duplicate inference. This is not automatic recovery of the expired job.
+  Extra user content on an ordinary live tool result remains rejected rather
+  than silently discarded. Reconcile potentially completed external work before
+  repeating it after interruption.
 - Text results only, at most 32 KiB after JSON encoding. Images, documents and
   oversized results fail explicitly; content is not silently discarded or
   truncated. The courier separately rejects responses above 48,000 bytes.
@@ -148,8 +177,13 @@ itself. The MCP stdio implementation uses protocol version `2024-11-05`.
   continue executing; cancellation cannot undo its effects.
 - Only the exact configured relay can be couriered. Other device tools return
   an explicit error and are not executed by this bridge.
-- The native stream buffers assistant text until a call or final boundary;
-  keepalives maintain HTTP liveness. It does not provide live token deltas.
+- Native SSE forwards actual upstream text deltas as they arrive. Narration
+  preceding a client call is delivered as a text block before its tool_use;
+  continuation matching validates both blocks. Text is never interpreted as
+  executable markup. The unread text queue is bounded at 1 MiB or 4096 text
+  events; overflow or a
+  failed downstream write cancels the job instead of silently dropping output.
+  A partial stream followed by an error remains an error, not a completed turn.
 - A native registry entry does not guarantee Quick will invoke it in every
   context. Model-level refusal and upstream policy still apply.
 - The receiving client's presentation contract stays inline with the native
@@ -163,11 +197,53 @@ itself. The MCP stdio implementation uses protocol version `2024-11-05`.
 
 ## Verification and acceptance
 
+### Completed-turn performance checkpoints
+
+After successful delivery of a normally completed native turn, the adapter may
+retain one checkpoint for its named client conversation, bounded to 32 entries
+and 10 minutes. It stores normalized transcript fingerprints, the system/model/
+tool contract and a private socket-pool key, not another copy of raw history.
+Only an exact prefix match including the delivered assistant response, followed
+by a new user message and optional environment messages, permits a delta turn.
+The bridge pins that still-live socket to its original account/device/tenant;
+the new request sends only the new message and newly referenced attachments.
+Each job still uses a fresh invocation route and retains its own receipts.
+
+Missing/expired sockets, changed history or contract, forks, compaction and
+anonymous requests seed a fresh upstream UUID with the full real transcript.
+An already started native Send is never replayed or sent to another account.
+Active native sockets are protected from pool sweeping; shutdown still closes
+them. Failed writes, refusals, partial closes and parked human questions do not
+create checkpoints. AskUserQuestion retains its explicit stopped-job/real-answer
+boundary and thus still needs full initialization after the human answers.
+
+Metadata-only diagnostics report connection reuse, full/sent byte counts,
+preparation stages, time to first text/thinking and response delivery. These are
+wall-clock stages, not estimates of model prefill, hidden thinking or queue time.
+Streaming improves visibility and checkpoint reuse avoids redundant delivery;
+neither guarantees a particular cloud response time or old-session recovery.
+
+An isolated live Quick comparison on 2026-11-24 used 199,319 bytes of initial
+synthetic request JSON and checked recall of an inert lookup value from the
+original context. The previous transport took 11.918 s for its cold turn and
+10.149 s for the next full-history turn. The checkpoint candidate took 11.698 s
+cold and 3.211 s for the continuation (first text at 2.951 s). Diagnostics
+confirmed reuse of the same live socket and a reduction of rendered context
+from 196,931 to 217 bytes, before per-turn relay guidance. Both versions passed
+the reference recall check. This is one synthetic comparison, not a benchmark
+of the user's large Desktop conversation or a guaranteed speedup.
+
 Local tests exercise actual loopback HTTP and WebSocket IO, plus an injected
 runner for state transitions. They cover repeated calls with one job, pending
 result delivery, transcript/catalog/session changes, precise numeric identity,
 duplicates, expiry, cancellation, route authorization, codec budgets, single
 argument delivery, real application errors, courier allowlists and no retries.
+Human-question tests cover answers after the old execution deadline, stopping
+the old exchange, exact-contract rejection without consuming the answer,
+single-use continuation, expiry/shutdown cleanup and the timer/admission race.
+They also cover Desktop's merged new-text/ended-question representation after
+restart, rejecting mismatched calls, ordinary-tool recovery, empty text,
+multimodal extras, multiple results and duplicate new submissions.
 These tests establish local adapter/state behavior, not cloud acceptance.
 
 Request-body tests cover UTF-8 byte boundaries, declared and unknown lengths,
@@ -202,8 +278,11 @@ rejection but returned a choice as literal `<decision>` / `<option>` text, with
 no client tool call despite declaring `AskUserQuestion`. A separate real Quick
 test with the deployed presentation guidance returned an actual native
 `AskUserQuestion` call and continued after a test-client answer. This verifies
-the native question round-trip only; actual Desktop question UI and compliance
-in that historical context remain pending.
+the native question round-trip only. A subsequent Desktop question did render
+and receive the user's choice, but its continuation failed after the entire
+300-second job deadline elapsed while waiting for the user. The human-question
+boundary above addresses that lifetime mismatch; live acceptance of that
+revised continuation is recorded separately from the earlier same-job test.
 
 Reproducing acceptance requires a formally registered relay on the proxy-owned outpost,
 then one fresh harmless request asking Desktop to Read only:

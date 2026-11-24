@@ -34,6 +34,7 @@ var (
 	ErrInvalidCall       = errors.New("tool call requires a name and valid JSON input")
 	ErrInvalidResult     = errors.New("tool result requires valid JSON content")
 	ErrInvalidCompletion = errors.New("tool exchange completed without a result or error")
+	ErrTextCapacity      = errors.New("tool exchange unread text exceeds 1 MiB or 4096 events")
 )
 
 type Call struct {
@@ -50,6 +51,7 @@ type Result struct {
 // Event has one call or a terminal result/error. Terminal events are readable
 // once, including when the exchange context has already ended.
 type Event struct {
+	Text  string
 	Call  *Call
 	Final *chat.TurnResult
 	Err   error
@@ -81,7 +83,9 @@ type Exchange struct {
 
 	mu             sync.Mutex
 	pending        map[string]*pendingCall
-	queue          []string
+	queue          []Event
+	textBytes      int
+	textEvents     int
 	retired        map[string]error
 	retiredOrder   []string
 	terminal       bool
@@ -151,7 +155,7 @@ func (e *Exchange) Call(ctx context.Context, name string, input json.RawMessage)
 		return Result{}, ErrCapacity
 	}
 	e.pending[id] = p
-	e.queue = append(e.queue, id)
+	e.queue = append(e.queue, Event{Call: &p.call})
 	e.signal()
 	e.mu.Unlock()
 	select {
@@ -185,6 +189,21 @@ func (e *Exchange) Next(ctx context.Context) (Event, error) {
 	for {
 		e.syncContext()
 		e.mu.Lock()
+		// Preserve text/call ordering, including text produced just before a
+		// terminal completion. finish removes only unresolved tool calls.
+		if len(e.queue) > 0 && e.queue[0].Call == nil {
+			if err := ctx.Err(); err != nil {
+				e.mu.Unlock()
+				return Event{}, err
+			}
+			ev := e.queue[0]
+			e.queue[0] = Event{}
+			e.queue = e.queue[1:]
+			e.textBytes -= len(ev.Text)
+			e.textEvents--
+			e.mu.Unlock()
+			return ev, nil
+		}
 		if e.terminal {
 			if e.finalDelivered {
 				e.mu.Unlock()
@@ -200,19 +219,27 @@ func (e *Exchange) Next(ctx context.Context) (Event, error) {
 			return Event{}, err
 		}
 		for len(e.queue) > 0 {
-			id := e.queue[0]
+			if e.queue[0].Call == nil {
+				break
+			}
+			id := e.queue[0].Call.ID
 			p := e.pending[id]
 			if err := p.ctx.Err(); err != nil {
 				e.remove(id, ErrCallCancelled)
 				p.answer <- outcome{err: err}
 				continue
 			}
+			e.queue[0] = Event{}
 			e.queue = e.queue[1:]
 			p.delivered = true
 			call := p.call
 			call.Input = cloneJSON(call.Input)
 			e.mu.Unlock()
 			return Event{Call: &call}, nil
+		}
+		if len(e.queue) > 0 {
+			e.mu.Unlock()
+			continue
 		}
 		e.mu.Unlock()
 		select {
@@ -222,6 +249,29 @@ func (e *Exchange) Next(ctx context.Context) (Event, error) {
 			// Recheck terminal state first so its error remains observable.
 		}
 	}
+}
+
+// PublishText queues genuine upstream text without interpreting it as a tool.
+// Slow readers have a fixed budget; exhaustion fails instead of dropping text
+// or blocking the upstream reader indefinitely.
+func (e *Exchange) PublishText(text string) error {
+	if text == "" {
+		return nil
+	}
+	e.syncContext()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.terminal {
+		return e.terminalError()
+	}
+	if len(text) > (1<<20)-e.textBytes || e.textEvents >= 4096 {
+		return ErrTextCapacity
+	}
+	e.queue = append(e.queue, Event{Text: text})
+	e.textBytes += len(text)
+	e.textEvents++
+	e.signal()
+	return nil
 }
 
 // Resolve consumes one delivered call exactly once. It never runs a tool.
@@ -289,7 +339,14 @@ func (e *Exchange) finish(final *chat.TurnResult, err error) {
 		p.answer <- outcome{err: waitErr}
 	}
 	clear(e.pending)
-	e.queue = nil
+	kept := e.queue[:0]
+	for _, ev := range e.queue {
+		if ev.Call == nil {
+			kept = append(kept, ev)
+		}
+	}
+	clear(e.queue[len(kept):])
+	e.queue = kept
 	close(e.done)
 	e.cancel()
 }
@@ -313,8 +370,10 @@ func (e *Exchange) signal() {
 func (e *Exchange) remove(id string, reason error) {
 	delete(e.pending, id)
 	for i, queued := range e.queue {
-		if queued == id {
-			e.queue = append(e.queue[:i], e.queue[i+1:]...)
+		if queued.Call != nil && queued.Call.ID == id {
+			copy(e.queue[i:], e.queue[i+1:])
+			e.queue[len(e.queue)-1] = Event{}
+			e.queue = e.queue[:len(e.queue)-1]
 			break
 		}
 	}

@@ -108,6 +108,18 @@ type TurnOpts struct {
 	// NativeRelay enables only the explicitly registered MCP relay on the
 	// proxy-owned outpost. It does not enable arbitrary local device execution.
 	NativeRelay string
+	// NativeContinuation is supplied only after the native adapter validates a
+	// delivered, completed transcript checkpoint. The full Text remains available
+	// for cold seeding if its owned socket has expired before this new turn.
+	NativeContinuation *NativeContinuation
+	// OnNativeSession hands the adapter an idempotent discard callback for a
+	// completed socket whose final response could not be delivered downstream.
+	OnNativeSession func(discard func())
+}
+
+type NativeContinuation struct {
+	Text        string
+	Attachments []Attachment
 }
 
 // Attachment is one multimodal input part to ship out-of-band.
