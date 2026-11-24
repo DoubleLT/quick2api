@@ -216,6 +216,14 @@ Live checks against a signed-in Quick account established:
   through `-probe`; its candidate server and deployed service both passed the
   streaming fixture loop. Heartbeats, write/flush failures and terminal SSE
   errors are established by local lifecycle tests, not a new Desktop replay.
+- The attachment-context candidate received the actual fixed fixture as a
+  top-level plain-text document and answered with its correct first line on
+  both the initial turn and an append-only follow-up. Both answers included a
+  source citation, so content delivery passed while exact first-line output
+  did not. Delta logging showed one historical attachment and zero attachments
+  sent on the follow-up. After deployment, the streaming client Read/result/
+  first-line loop also passed. These checks do not replay a private old session
+  or establish image/PDF delivery or natural-language refusal recovery.
 
 For an installation check, build `./cmd/quick2api` and run
 `quick2api -config <your-config> -probe`. Use a proxy-owned outpost and a
