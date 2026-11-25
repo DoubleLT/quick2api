@@ -64,6 +64,14 @@ func prepareNativeRuntime(ctx context.Context, sess *session.Session, name strin
 		"appVersion": "1.2.4660", "acp_first_text": 1, "user_notification": 1,
 		"subtask_progress": 1, "external_agent_sign_in": 1, "recents_promotion": 1,
 	}}
+	// The caller owns a ready runtime. Failed preparation has no caller to
+	// close its private transport, whose idle connections otherwise persist.
+	prepared := false
+	defer func() {
+		if !prepared {
+			runtime.client.CloseIdleConnections()
+		}
+	}()
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	for {
@@ -122,6 +130,7 @@ func prepareNativeRuntime(ctx context.Context, sess *session.Session, name strin
 				if tool.Schema.Type != "object" || !required["route_id"] || !required["name"] || !required["arguments"] || p["route_id"].Type != "string" || p["name"].Type != "string" || p["arguments"].Type != "object" {
 					return bad("registered native relay does not expose the expected routing schema")
 				}
+				prepared = true
 				return runtime, nil
 			}
 		}

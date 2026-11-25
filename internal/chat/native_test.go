@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -76,6 +77,67 @@ func TestNativeCatalogRejectsDisconnectedDisabledAndWrongSchemas(t *testing.T) {
 			_, err := prepareNativeRuntime(context.Background(), &session.Session{OutpostURL: srv.URL, OutpostToken: "fixture", OutpostID: "fixture"}, relayTestName)
 			if err == nil {
 				t.Fatal("unavailable or incompatible relay accepted")
+			}
+		})
+	}
+}
+
+func TestNativeCatalogConnectionOwnership(t *testing.T) {
+	for _, kind := range []string{"disabled", "wrong-schema", "ready"} {
+		t.Run(kind, func(t *testing.T) {
+			var connections atomic.Int32
+			closed := make(chan struct{}, 2)
+			catalog := relayTestCatalog
+			switch kind {
+			case "disabled":
+				catalog = strings.Replace(catalog, `"enabled":true`, `"enabled":false`, 1)
+			case "wrong-schema":
+				catalog = strings.Replace(catalog, `"route_id":{"type":"string"}`, `"route_id":{"type":"object"}`, 1)
+			}
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/local/mcp/list":
+					_, _ = w.Write([]byte(catalog))
+				case "/local/invoke_tool":
+					_, _ = w.Write([]byte(`{"content":[],"isError":false}`))
+				default:
+					t.Errorf("unexpected request path: %s", r.URL.Path)
+				}
+			}))
+			srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections.Add(1)
+				}
+				if state == http.StateClosed {
+					select {
+					case closed <- struct{}{}:
+					default:
+					}
+				}
+			}
+			srv.Start()
+			defer srv.Close()
+			runtime, err := prepareNativeRuntime(context.Background(), &session.Session{OutpostURL: srv.URL, OutpostToken: "fixture", OutpostID: "fixture"}, relayTestName)
+			if kind == "ready" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer runtime.client.CloseIdleConnections()
+				out := runtime.invoke(context.Background(), NativeCall{ID: "fixture-call", Name: relayTestName, Arguments: json.RawMessage(`{}`)})
+				if out.err != nil || len(out.result) == 0 {
+					t.Fatalf("prepared runtime could not invoke its relay: %+v", out)
+				}
+				if connections.Load() != 1 {
+					t.Fatal("successful preparation closed the caller-owned connection before invocation")
+				}
+				runtime.client.CloseIdleConnections()
+			} else if err == nil || runtime != nil {
+				t.Fatal("unavailable relay accepted")
+			}
+			select {
+			case <-closed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("native catalog connection remained open after its owner finished")
 			}
 		})
 	}
